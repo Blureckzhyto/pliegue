@@ -43,7 +43,7 @@ def show_about(root, version: str) -> ctk.CTkToplevel:
     image = logo("wordmark_sidebar", 40)
     if image is not None:
         ctk.CTkLabel(body, text="", image=image).pack(anchor="w")
-    ctk.CTkLabel(body, text=f"Pliegue (antes PDFKit) · versión {version}", font=theme.FONT_HEADING,
+    ctk.CTkLabel(body, text=f"Pliegue · versión {version}", font=theme.FONT_HEADING,
                  text_color=theme.TEXT_PRIMARY).pack(anchor="w", pady=(12, 0))
     ctk.CTkLabel(body, text=f"© {project.YEAR} {project.GITHUB_USER or 'Pliegue'} · Licencia AGPL-3.0", font=theme.FONT_SMALL,
                  text_color=theme.TEXT_SECONDARY).pack(anchor="w", pady=(2, 10))

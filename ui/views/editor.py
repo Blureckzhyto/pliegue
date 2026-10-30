@@ -96,6 +96,10 @@ class PdfEditorView(ToolView):
         self.ed_render_job = None
         self.ed_verify = {}          # (página, id) -> cómo estaba antes de la edición sin comprobar
         self.ed_confirm_dialog = None
+        self.ed_overflow_dialog = None
+        self.ed_push = True          # el texto que crece desplaza el contenido de abajo
+        self.ed_adjust = False       # el texto que se acorta sube el contenido de abajo
+        self.ed_reflowing = False    # hay una edición integrándose al documento (en segundo plano)
         self.ed_pending_double = None  # doble clic llegado antes de que la página esté lista
         self.ed_thumbs: dict[int, ImageTk.PhotoImage] = {}
         self.ed_thumbs_loading: set[int] = set()
@@ -216,7 +220,10 @@ class PdfEditorView(ToolView):
         return self.ed_states.setdefault(index, {"overrides": {}, "added": [], "z": None})
 
     def _snapshot(self):
-        return copy.deepcopy((self.ed_states, self.ed_order, self.ed_rotations, self.ed_next_id))
+        # los bytes del documento van tal cual (no se copian): una edición que movió contenido
+        # cambió el documento base, y deshacerla es volver a estos bytes
+        data = self.ed_session.data if self.ed_session else None
+        return copy.deepcopy((self.ed_states, self.ed_order, self.ed_rotations, self.ed_next_id)) + (data,)
 
     def _push_undo(self):
         self.ed_undo.append(self._snapshot())
@@ -224,7 +231,15 @@ class PdfEditorView(ToolView):
         self.ed_redo.clear()
 
     def _restore(self, snapshot):
-        self.ed_states, self.ed_order, self.ed_rotations, self.ed_next_id = copy.deepcopy(snapshot)
+        states, order, rotations, next_id, data = snapshot
+        self.ed_states, self.ed_order, self.ed_rotations, self.ed_next_id = copy.deepcopy(
+            (states, order, rotations, next_id))
+        if self.ed_session is not None and data is not None and data is not self.ed_session.data:
+            self.ed_session.adopt(data)
+            self.ed_models.clear()
+            self.ed_thumbs.clear()
+            self.ed_thumbs_loading.clear()
+            self.ed_layout = {}
         self.ed_verify.clear()   # el estado restaurado ya se mostró bien antes
         if self.ed_current not in self.ed_order:
             self.ed_current = self.ed_order[0] if self.ed_order else None
@@ -234,6 +249,8 @@ class PdfEditorView(ToolView):
 
     def _undo(self):
         self._commit_edit()
+        if self.ed_reflowing:
+            return
         if not self.ed_undo:
             self.show_info("No hay nada para deshacer.")
             return
@@ -242,6 +259,8 @@ class PdfEditorView(ToolView):
         self.show_info("Se deshizo el último cambio.")
 
     def _redo(self):
+        if self.ed_reflowing:
+            return
         if not self.ed_redo:
             self.show_info("No hay nada para rehacer.")
             return
@@ -613,6 +632,8 @@ class PdfEditorView(ToolView):
             self.ed_canvas.focus_force()   # también activa la ventana: el clic sigue procesándose
         if self.ed_editor:
             self._commit_edit()
+            return
+        if self.ed_reflowing:
             return
         if self.ed_space:   # Espacio + arrastre: mover la vista
             self.ed_canvas.scan_mark(event.x, event.y)
@@ -1027,9 +1048,14 @@ class PdfEditorView(ToolView):
             if line["id"] in element.get("line_ids", [])]
         if not lines or any(not line.get("spans") for line in lines):
             return
-        if "\n".join(line["text"] for line in lines) != element["text"]:
-            return   # ya se editó: el reparto entre fragmentos cambió
-        offset = 0
+        shown = widget.get("1.0", "end-1c")
+        offsets, position = [], 0
+        for line in lines:       # cada línea original dentro del texto que se muestra
+            position = shown.find(line["text"], position)
+            if position < 0:
+                return   # ya se editó: el reparto entre fragmentos cambió
+            offsets.append(position)
+            position += len(line["text"])
         for row, line in enumerate(lines):
             col = 0
             for n, span in enumerate(line["spans"]):
@@ -1044,13 +1070,26 @@ class PdfEditorView(ToolView):
                 font = self._tk_font(style, max(6, round(float(span["size"]) * scale)), bold, italic)
                 tag = f"span_{row}_{n}"
                 widget.tag_configure(tag, font=font, foreground=span["color"])
-                widget.tag_add(tag, f"{row + 1}.{col}", f"{row + 1}.{col + length}")
+                widget.tag_add(tag, f"1.0+{offsets[row] + col}c", f"1.0+{offsets[row] + col + length}c")
                 widget._fonts = getattr(widget, "_fonts", []) + [font]
                 col += length
-            offset += len(line["text"]) + 1
+
+    def _edit_room(self, uid, element, origin):
+        """Hasta dónde puede crecer el texto: {right, rest_x, align} en puntos."""
+        room = None
+        if not uid.startswith("N"):
+            try:
+                room = self.ed_session.edit_geometry(self.ed_current, uid)
+            except Exception:
+                errors.record("No se pudo calcular el ancho del párrafo")
+        if room is None:
+            width = self._model()["width"]
+            room = {"right": width - max(36.0, min(72.0, origin[0])), "rest_x": origin[0],
+                    "align": element["style"].get("align", "left")}
+        return room
 
     def _begin_edit(self, uid, click=None, caret=None):
-        if self.ed_editor:
+        if self.ed_editor or self.ed_reflowing:
             return
         self._prepare(uid)
         element = self._element(uid)
@@ -1068,39 +1107,45 @@ class PdfEditorView(ToolView):
         # sobre el texto: mismo x de inicio (el origen del primer glifo) y misma línea base
         left = MARGIN + origin[0] * s
         top = MARGIN + origin[1] * s - font.metrics("ascent")
-        lines = max(1, element["text"].count("\n") + 1)
         line_px = float(style.get("line_height") or style["size"] * 1.2) * s
-        widget = tk.Text(self.ed_canvas, wrap="word" if is_block else "none", font=font,
+        shown = element["text"]
+        if is_block and "text" not in self._st()["overrides"].get(uid, {}):
+            # un párrafo se edita corrido: los saltos de renglón del PDF no son parte del texto
+            shown = self.ed_session.flow_text(self.ed_current, uid) or shown
+        room = self._edit_room(uid, element, origin)
+        base_x = min(origin[0], room["rest_x"])
+        left = MARGIN + base_x * s
+        block_width = max(20, (room["right"] - base_x) * s)   # hasta donde llega un renglón
+        widget = tk.Text(self.ed_canvas, wrap="word", font=font,
                          fg=style["color"], bg=self._sample_bg(box), insertbackground=style["color"],
                          relief="flat", bd=0, highlightthickness=0, padx=0, pady=0, undo=True,
                          spacing1=0, spacing3=0,
                          spacing2=max(0, int(line_px - font.metrics("linespace"))))
-        block_width = (box[2] - box[0]) * s
 
         def fit(_event=None):
-            """El cuadro crece con el texto (en párrafos, el ancho es el del párrafo)."""
+            """El cuadro crece con el texto: a lo ancho hasta el borde del párrafo y, de ahí en
+            adelante, hacia abajo, como quedará al confirmar."""
             if not widget.winfo_exists():
                 return
             rows = widget.get("1.0", "end-1c").split("\n")
-            if is_block:
-                width = block_width
-                shown = widget.count("1.0", "end", "displaylines")
-                count = max(lines, shown[0] if shown else lines)
-            else:
-                width = max(font.measure(r) for r in rows) + 4
-                count = len(rows)
+            indent = (origin[0] - base_x) * s
+            width = block_width if is_block else min(block_width, max(font.measure(r) for r in rows) + indent + 4)
+            self.ed_canvas.itemconfigure("editor", width=max(8, width))
+            widget.update_idletasks()
+            counted = widget.count("1.0", "end", "displaylines")
+            count = max(len(rows), counted[0] if counted else 1)
             height = font.metrics("linespace") + (count - 1) * line_px + 2
-            self.ed_canvas.itemconfigure("editor", width=max(8, width), height=height)
+            self.ed_canvas.itemconfigure("editor", height=height)
             self.ed_editor_geom = [left, top, left + max(8, width), top + height]
             self._draw_overlay()
-        widget.insert("1.0", element["text"])
+        widget.insert("1.0", shown)
         self._format_spans(widget, uid, element, s)
-        if is_block:
-            widget.tag_configure("all", justify={"center": "center", "right": "right"}.get(
-                style.get("align"), "left"))
-            widget.tag_add("all", "1.0", "end")
+        widget.tag_configure("all", justify={"center": "center", "right": "right"}.get(room["align"], "left"),
+                             lmargin1=(origin[0] - base_x) * s, lmargin2=(room["rest_x"] - base_x) * s)
+        widget.tag_add("all", "1.0", "end")
         self.ed_canvas.create_window(left, top, anchor="nw", window=widget, tags="editor")
         self.ed_editor = (widget, uid, font)
+        self.ed_editor_shown = shown     # el texto con que se abrió (para saber si cambió)
         fit()
         widget.bind("<KeyRelease>", fit, add="+")
         widget.bind("<<Paste>>", lambda _e: widget.after_idle(fit), add="+")
@@ -1126,6 +1171,7 @@ class PdfEditorView(ToolView):
         if not self.ed_editor:
             return
         widget, uid, _font = self.ed_editor
+        shown = self.ed_editor_shown
         self.ed_editor = None
         self.ed_editor_geom = None
         text = widget.get("1.0", "end-1c")
@@ -1138,7 +1184,7 @@ class PdfEditorView(ToolView):
                 self._select(None)
             self._draw_overlay()
             return
-        if text == element["text"]:
+        if text == shown:
             if uid.startswith("N") and not text:
                 self._st()["added"] = [a for a in self._st()["added"] if a["id"] != uid]
                 self._select(None)
@@ -1164,6 +1210,13 @@ class PdfEditorView(ToolView):
             override = overrides.setdefault(uid, {})
             override["text"] = text
             override.pop("font_ok", None)    # texto nuevo: hay que volver a confirmar
+            if self._needs_reflow(uid, override):
+                self.ed_verify.pop((self.ed_current, uid), None)  # se comprueba al integrarla
+                self._start_reflow(uid)
+                return
+        self._finish_commit(uid)
+
+    def _finish_commit(self, uid):
         self.ed_layout.pop(uid, None)
         self._after_change()
         self.show_info("Cambio aplicado (Ctrl+Z para deshacer).")
@@ -1171,6 +1224,162 @@ class PdfEditorView(ToolView):
             self._refresh_font_note(self.ed_selected)
         if not uid.startswith("N"):
             self._check_substitution(uid)
+
+    # ------------------------------------------------------------------ el texto ya no cabe
+
+    def _needs_reflow(self, uid, override):
+        try:
+            return self.ed_session.needs_reflow(self.ed_current, uid, override, self.ed_push, self.ed_adjust)
+        except Exception:
+            errors.record("No se pudo calcular cómo acomodar el texto")
+            return False
+
+    def _start_reflow(self, uid):
+        """Integra la edición al documento en segundo plano: el texto ocupa otra cantidad de
+        renglones y hay que mover contenido. Deshacer la revierte entera, de un solo paso."""
+        index, session = self.ed_current, self.ed_session
+        state = copy.deepcopy(self._st())
+        push, adjust = self.ed_push, self.ed_adjust
+        self.ed_reflowing = True
+        self.show_info("Acomodando el texto…")
+
+        def done(result):
+            self.ed_reflowing = False
+            if session is not self.ed_session:
+                return
+            if result.status == "done":
+                self._adopt_reflow(index, result)
+            elif result.status == "overflow":
+                self._ask_overflow(index, result)
+            elif result.status == "pending":
+                self._ask_substitution(result.pending, when="reflow")
+            else:
+                self._finish_commit(uid)
+
+        def failed(exc):
+            self.ed_reflowing = False
+            if session is self.ed_session:
+                self._reflow_failed(index, uid, exc)
+
+        run_task(self, lambda _p: session.reflow(index, state, uid, push, adjust), done, failed)
+
+    def _reflow_failed(self, index, uid, exc):
+        """No quedó bien: vuelve todo como estaba y se dice por qué (nunca en silencio)."""
+        reason = errors.reason(exc)
+        errors.log.error("Edición deshecha en la página %d (%s): %s", index + 1, uid, reason)
+        if self.ed_undo:
+            self._restore(self.ed_undo.pop())
+        self.show_error(f"No se pudo aplicar la edición: {reason}")
+
+    def _adopt_reflow(self, index, result):
+        """El documento base pasa a ser el resultado; las páginas nuevas van después de `index`."""
+        added = result.added_pages
+
+        def moved(i):
+            return i + added if i > index else i
+
+        self.ed_session.adopt(result.data)
+        self.ed_states = {moved(i): state for i, state in self.ed_states.items() if i != index}
+        self.ed_rotations = {moved(i): r for i, r in self.ed_rotations.items()}
+        position = self.ed_order.index(index) if index in self.ed_order else len(self.ed_order)
+        order = [moved(i) for i in self.ed_order]
+        order[position + 1:position + 1] = list(range(index + 1, index + 1 + added))
+        self.ed_order = order
+        self.ed_models.clear()
+        self.ed_thumbs.clear()
+        self.ed_thumbs_loading.clear()
+        self.ed_layout = {}
+        self.ed_verify.clear()
+        self._select(None, render=False)
+        self._draw_thumbs()
+        self._show_page()
+        self.show_info(f"{result.message} (Ctrl+Z para deshacer)")
+
+    def _ask_overflow(self, index, result):
+        """El texto ya no cabe en la página: se elige qué hacer viendo cómo quedaría cada opción."""
+        if self.ed_overflow_dialog is not None:
+            return
+        root = self.winfo_toplevel()
+        dialog = ctk.CTkToplevel(root, fg_color=theme.BG_PRIMARY)
+        dialog.title("El texto no cabe en la página")
+        dialog.resizable(False, False)
+        dialog.transient(root)
+        self.ed_overflow_dialog = dialog
+        lines = result.extra_lines
+        word = "línea más" if lines == 1 else "líneas más"
+        ctk.CTkLabel(dialog, text=f"El texto ocupa {lines} {word} y lo de abajo ya no cabe en esta página.",
+                     font=theme.FONT_BODY, text_color=theme.TEXT_PRIMARY, wraplength=640,
+                     justify="left").pack(padx=24, pady=(20, 10), anchor="w")
+        body = ctk.CTkFrame(dialog, fg_color="transparent")
+        body.pack(fill="x", padx=24)
+        options = ctk.CTkFrame(body, fg_color="transparent")
+        options.pack(side="left", anchor="n", padx=(0, 16))
+        preview = ctk.CTkFrame(body, **theme.CARD)
+        preview.pack(side="left", anchor="n")
+        choice = tk.StringVar(value="newpage")
+        note = ctk.CTkLabel(options, text="", font=theme.FONT_SMALL, text_color=theme.TEXT_SECONDARY,
+                            wraplength=300, justify="left")
+        dialog.ed_photos = {}
+        dialog.ed_preview_labels = []
+
+        def show(*_args):
+            for label in dialog.ed_preview_labels:
+                label.destroy()
+            dialog.ed_preview_labels = []
+            candidate = result.candidates[choice.get()]
+            note.configure(text=candidate.message)
+            for image in candidate.previews[:2]:
+                photo = ImageTk.PhotoImage(image)
+                dialog.ed_photos.setdefault(choice.get(), []).append(photo)
+                label = tk.Label(preview, image=photo, bd=1, relief="solid")
+                label.pack(side="left", padx=6, pady=6)
+                dialog.ed_preview_labels.append(label)
+
+        def finish(apply):
+            if self.ed_overflow_dialog is None:
+                return
+            self.ed_overflow_dialog = None
+            selected = choice.get()
+            dialog.grab_release()
+            dialog.destroy()
+            if apply:
+                self._adopt_reflow(index, result.candidates[selected])
+            else:
+                if self.ed_undo:
+                    self._restore(self.ed_undo.pop())
+                self.show_info("No se cambió nada: el texto queda como estaba.")
+
+        dialog.ed_radios = {}
+        for key, label in (("newpage", "Pasar el sobrante a una página nueva"),
+                           ("shrink", "Reducir un poco el tamaño de letra del párrafo"),
+                           ("tighten", "Reducir el interlineado del párrafo")):
+            available = key in result.candidates
+            radio = ctk.CTkRadioButton(options, text=label if available else f"{label} (no alcanza)",
+                                       variable=choice, value=key, command=show,
+                                       state="normal" if available else "disabled",
+                                       font=theme.FONT_BODY, text_color=theme.TEXT_PRIMARY,
+                                       fg_color=theme.ACCENT, hover_color=theme.ACCENT)
+            radio.pack(anchor="w", pady=4)
+            dialog.ed_radios[key] = radio
+        note.pack(anchor="w", pady=(10, 0))
+        row = ctk.CTkFrame(dialog, fg_color="transparent")
+        row.pack(fill="x", padx=24, pady=(14, 20))
+        dialog.ed_choice = choice
+        dialog.ed_buttons = {
+            "apply": ctk.CTkButton(row, text="Aplicar", command=lambda: finish(True), **theme.BTN_PRIMARY),
+            "cancel": ctk.CTkButton(row, text="Cancelar", command=lambda: finish(False), **theme.BTN_SECONDARY),
+        }
+        dialog.ed_buttons["apply"].pack(side="left", padx=(0, 8))
+        dialog.ed_buttons["cancel"].pack(side="left")
+        dialog.bind("<Escape>", lambda _e: finish(False))
+        dialog.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        show()
+        dialog.update_idletasks()
+        x = root.winfo_rootx() + (root.winfo_width() - dialog.winfo_reqwidth()) // 2
+        y = root.winfo_rooty() + (root.winfo_height() - dialog.winfo_reqheight()) // 3
+        dialog.geometry(f"+{max(0, x)}+{max(0, y)}")
+        dialog.after(260, lambda: dialog.winfo_exists() and dialog.iconbitmap(str(asset_path("icon.ico"))))
+        dialog.after(10, lambda: dialog.winfo_exists() and dialog.grab_set())
 
     def _delete_text(self, uid):
         """Quita un texto (confirmado por el usuario al dejarlo vacío)."""
@@ -1418,10 +1627,33 @@ class PdfEditorView(ToolView):
             _icon_button(right, name, command, self, hint, width=32).pack(side="left", padx=1)
         if style is not None:
             # segunda línea: así la nota de fuente nunca queda recortada
-            self.ed_note_label = ctk.CTkLabel(self.ed_props, text=self.ed_font_note, anchor="w",
+            second = ctk.CTkFrame(self.ed_props, fg_color="transparent")
+            second.pack(fill="x", pady=(4, 0))
+            self.ed_flow_switches = {}
+            for key, label, value in (("adjust", "Ajustar contenido de abajo", self.ed_adjust),
+                                      ("push", "Desplazar contenido de abajo", self.ed_push)):
+                switch = ctk.CTkCheckBox(second, text=label, width=20, height=18, checkbox_width=16,
+                                         checkbox_height=16, command=lambda k=key: self._toggle_flow(k),
+                                         **{**theme.CHECKBOX, "font": theme.FONT_SMALL})
+                if value:
+                    switch.select()
+                switch.pack(side="right", padx=(10, 0))
+                self.ed_flow_switches[key] = switch
+            self.ed_note_label = ctk.CTkLabel(second, text=self.ed_font_note, anchor="w",
                                               font=theme.FONT_SMALL, text_color=theme.TEXT_SECONDARY)
-            self.ed_note_label.pack(fill="x", pady=(4, 0))
+            self.ed_note_label.pack(side="left", fill="x", expand=True)
         anim.enhance(self.ed_props)
+
+    def _toggle_flow(self, key):
+        value = bool(self.ed_flow_switches[key].get())
+        if key == "push":
+            self.ed_push = value
+            self.show_info("El texto que crece desplaza el contenido de abajo." if value
+                           else "El texto que crece ya no mueve el contenido de abajo.")
+        else:
+            self.ed_adjust = value
+            self.show_info("Si el texto se acorta, el contenido de abajo sube." if value
+                           else "Si el texto se acorta, el contenido de abajo se queda en su lugar.")
 
     def _prop_label(self, text):
         ctk.CTkLabel(self.ed_props_row, text=text, font=theme.FONT_SECTION,
@@ -1744,6 +1976,10 @@ class PdfEditorView(ToolView):
 
     def run(self, allow_substitution=False):
         self._commit_edit()
+        if self.ed_reflowing or self.ed_overflow_dialog is not None:   # primero termina esa edición
+            if self.ed_reflowing:
+                self.after(150, lambda: self.run(allow_substitution))
+            return
         if self.ed_session is None:
             self.show_error("Abre un PDF primero.")
             return
@@ -1831,12 +2067,14 @@ class PdfEditorView(ToolView):
                         item["substitute"]
                 if when == "save":
                     self.run()
+                elif when == "reflow":
+                    self._start_reflow(first["uid"])
                 else:
                     self._after_change()
                     self.show_info(f"Se usará {first['substitute']} para las letras que faltan.")
             elif action == "edit":
                 self._edit_problem(first)
-            elif when == "edit":   # se descarta la edición: el texto vuelve a ser el original
+            elif when in ("edit", "reflow"):   # se descarta la edición: el texto vuelve a ser el original
                 if self.ed_undo:
                     self._restore(self.ed_undo.pop())
                 self.show_info("Se descartó el cambio: la fuente original no tiene esas letras.")

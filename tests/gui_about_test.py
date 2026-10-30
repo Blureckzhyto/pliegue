@@ -49,7 +49,7 @@ def run():
 
     labels = [w.cget("text") for w in dialog.winfo_children()[0].winfo_children() if isinstance(w, ctk.CTkLabel)]
     joined = " ".join(str(t) for t in labels)
-    check("muestra el nombre, el anterior y la versión", f"Pliegue (antes PDFKit) · versión {VERSION}" in joined,
+    check("muestra el nombre y la versión", f"Pliegue · versión {VERSION}" in joined and "PDFKit" not in joined,
           joined[:120])
     check("el título de la ventana es «Acerca de Pliegue»", dialog.title() == "Acerca de Pliegue", dialog.title())
     check("menciona la GNU Affero General Public License", "GNU Affero General Public License" in joined)

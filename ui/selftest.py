@@ -303,7 +303,7 @@ def _failure_checks(app, pdf: Path, out_dir: Path, needle: str) -> list[dict]:
 
 # --------------------------------------------------------------- clics y teclas reales
 
-VK = {"x": 0x58, "BackSpace": 0x08, "Delete": 0x2E, "Return": 0x0D, "Escape": 0x1B}
+VK = {"x": 0x58, "space": 0x20, "BackSpace": 0x08, "Delete": 0x2E, "Return": 0x0D, "Escape": 0x1B}
 
 
 class OtherAppInTheWay(RuntimeError):
@@ -515,6 +515,35 @@ def _input_cases(app, pdf: Path, out_dir: Path, needle: str, results: list[dict]
     d.rendered()
     back = any(a["id"] == uid for a in v._st()["added"])
     result.update(borrado=gone, deshacer=back, ok=bool(uid) and gone and back)
+
+    # 6) escribir más de lo que cabe: el texto pasa al renglón siguiente, nada se cancela
+    result = new_result("texto que no cabe en la línea")
+    original = v._element(line["id"])["text"]
+    select(line)
+    d.settle(200)
+    _key("x")
+    d.wait(lambda: v.ed_editor is not None, 3)
+    d.settle(200)
+    widget = v.ed_editor[0]
+    start_height = v.ed_editor_geom[3] - v.ed_editor_geom[1]
+    widget.insert("end-1c", " palabra" * 40)
+    widget.event_generate("<KeyRelease>")
+    d.settle(200)
+    result["crecio"] = v.ed_editor_geom[3] - v.ed_editor_geom[1] > start_height * 1.5
+    _key("Return")
+    d.wait(lambda: not v.ed_reflowing, 20)
+    d.rendered()
+    if v._model() is None:
+        d.wait(lambda: v._model() is not None, 10)
+    text = v.ed_session.doc[v.ed_current].get_text()
+    result["estado"] = v.status.cget("text")
+    result.update(completo="palabra palabra" in text and "No se pudo" not in v.status.cget("text"))
+    v._undo()
+    d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
+    d.rendered()
+    back_text = " ".join(v.ed_session.doc[v.ed_current].get_text().split())
+    result["deshecho"] = "palabra" not in back_text and " ".join(original.split()) in back_text
+    result["ok"] = result["crecio"] and result["completo"] and result["deshecho"]
     return results
 
 

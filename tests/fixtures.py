@@ -58,3 +58,97 @@ def portada(path: Path) -> Path:
     target.show_pdf_page(target.rect, inner, 0)   # el texto queda dentro de un Form XObject
     outer.save(path, garbage=3, deflate=True)
     return path
+
+
+# --------------------------------------------------------------------------- texto que no cabe
+
+LOREM = ("Este informe describe los resultados del trimestre con el detalle de cada región y explica "
+         "las diferencias frente al periodo anterior para que el equipo pueda tomar decisiones. ")
+
+
+def _styles():
+    from reportlab.lib.enums import TA_JUSTIFY
+    from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+
+    sheet = getSampleStyleSheet()
+    body = ParagraphStyle("Cuerpo", parent=sheet["BodyText"], fontName="Helvetica", fontSize=11,
+                          leading=14, textColor="#223344", spaceAfter=8)
+    return {"title": sheet["Title"], "h2": sheet["Heading2"], "body": body,
+            "just": ParagraphStyle("Just", parent=body, alignment=TA_JUSTIFY)}
+
+
+def _picture(path: Path) -> Path:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (240, 120), "#2F7FE0")
+    draw = ImageDraw.Draw(image)
+    draw.ellipse((20, 20, 100, 100), fill="#FFE600")
+    draw.rectangle((130, 30, 220, 90), fill="#E5484D")
+    image.save(path)
+    return path
+
+
+def _table():
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    rows = [["Región", "Enero", "Febrero"], ["Norte", "1,200", "1,310"], ["Centro", "1,337", "1,400"],
+            ["Sur", "1,455", "1,490"]]
+    table = Table(rows, colWidths=[140, 90, 90])
+    table.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.6, colors.HexColor("#556677")),
+                               ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#EEF1F5")),
+                               ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold")]))
+    return table
+
+
+def reflow_page(path: Path) -> Path:
+    """Una columna: título, párrafos y, debajo, otro título, una imagen y una tabla."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import Image, Paragraph, SimpleDocTemplate, Spacer
+
+    s = _styles()
+    picture = _picture(Path(path).with_suffix(".png"))
+    SimpleDocTemplate(str(path), pagesize=A4, leftMargin=72, rightMargin=72, topMargin=72,
+                      bottomMargin=72).build([
+        Paragraph("Informe trimestral", s["title"]), Paragraph(LOREM * 3, s["body"]),
+        Paragraph("Primer parrafo de cierre. " + LOREM, s["body"]),
+        Paragraph("Resultados por region", s["h2"]), Image(str(picture), width=180, height=90),
+        Spacer(1, 10), _table(), Spacer(1, 10), Paragraph("Texto final debajo de la tabla.", s["body"])])
+    return path
+
+
+def reflow_columns(path: Path) -> Path:
+    """Dos columnas con párrafos: solo debe moverse la columna editada."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import BaseDocTemplate, Frame, FrameBreak, PageTemplate, Paragraph
+
+    s = _styles()
+    doc = BaseDocTemplate(str(path), pagesize=A4)
+    frames = [Frame(60, 60, 225, 720, id="a", leftPadding=0, rightPadding=0),
+              Frame(310, 60, 225, 720, id="b", leftPadding=0, rightPadding=0)]
+    doc.addPageTemplates([PageTemplate(id="dos", frames=frames)])
+    left = [Paragraph(f"Columna izquierda {n}. " + LOREM, s["body"]) for n in range(1, 5)]
+    right = [Paragraph(f"Columna derecha {n}. " + LOREM, s["body"]) for n in range(1, 5)]
+    doc.build(left + [FrameBreak()] + right)
+    return path
+
+
+def reflow_full(path: Path) -> Path:
+    """Una página casi llena: empujar el contenido pasa del margen inferior."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import Paragraph, SimpleDocTemplate
+
+    s = _styles()
+    SimpleDocTemplate(str(path), pagesize=A4, leftMargin=72, rightMargin=72, topMargin=72, bottomMargin=72).build(
+        [Paragraph(f"Parrafo {n:02d}. " + LOREM, s["body"]) for n in range(1, 15)])
+    return path
+
+
+def reflow_justified(path: Path) -> Path:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import Paragraph, SimpleDocTemplate
+
+    s = _styles()
+    SimpleDocTemplate(str(path), pagesize=A4, leftMargin=72, rightMargin=72, topMargin=72, bottomMargin=72).build(
+        [Paragraph(LOREM * 4, s["just"]), Paragraph("Segundo parrafo. " + LOREM * 2, s["just"])])
+    return path

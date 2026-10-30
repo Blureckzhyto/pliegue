@@ -31,6 +31,7 @@ from pathlib import Path
 from . import errors, font_finder
 from . import pdf_textops as tops
 from .edit_sign import ENCRYPTED_MSG
+from .pdf_flow import FlowMixin
 
 try:
     import pymupdf as fitz
@@ -136,11 +137,13 @@ def _variant(bold: bool, italic: bool) -> int:
 
 # --------------------------------------------------------------------------- sesión
 
-class EditorSession:
+class EditorSession(FlowMixin):
     """Copia normalizada del PDF abierta con PyMuPDF + análisis por página.
 
     El documento de la sesión solo se usa bajo `self.lock` (PyMuPDF no es
     seguro entre hilos); las vistas previas y el guardado abren su propia copia.
+    Una edición que mueve contenido (pdf_flow.py) se integra al documento base: `adopt`
+    cambia los bytes de la sesión y `self.data` antes del cambio sirve para deshacerlo.
     """
 
     def __init__(self, src):
@@ -164,23 +167,51 @@ class EditorSession:
             self.data = buf.getvalue()
         else:
             self.data = self.src.read_bytes()
+        self._setup()
+
+    @classmethod
+    def from_bytes(cls, src, data: bytes) -> "EditorSession":
+        """Sesión sobre un contenido ya normalizado (el documento con cambios integrados)."""
+        session = cls.__new__(cls)
+        session.src = Path(src)
+        session.data = data
+        session._setup()
+        return session
+
+    def _setup(self):
         self.lock = threading.Lock()
         self.doc = fitz.open(stream=self.data, filetype="pdf")
         self.page_count = self.doc.page_count
-        self._models: dict[int, dict] = {}
         self._font_cache: dict[tuple, tuple] = {}
+        self._ops_lock = threading.Lock()
+        self.font_log: list[str] = []   # cada decisión de fuente (también en el registro)
+        self._reset_analysis()
+
+    def _reset_analysis(self):
+        self._models: dict[int, dict] = {}
         self._pk = None                                  # el mismo PDF abierto con pikepdf
         self._fonts: dict[int, tops.FontInfo] = {}       # fuentes del PDF por número de objeto
         self._texts: dict[int, tops.PageText] = {}       # glifos ubicados por página
         self._form_uses: dict[int, int] | None = None
-        self._ops_lock = threading.Lock()
         self._full_fonts: dict = {}
-        self.font_log: list[str] = []   # cada decisión de fuente (también en el registro)
+
+    def adopt(self, data: bytes) -> None:
+        """Cambia el documento base por `data` (una edición integrada, o deshacerla)."""
+        with self.lock:
+            if data is self.data:
+                return
+            self.doc.close()
+            if self._pk:
+                self._pk.close()
+            self.data = data
+            self.doc = fitz.open(stream=data, filetype="pdf")
+            self.page_count = self.doc.page_count
+            self._reset_analysis()
 
     def close(self):
         with self.lock:
             self.doc.close()
-            if self._pk is not None:
+            if self._pk:
                 self._pk.close()
 
     def page_size(self, index: int) -> tuple[float, float]:
@@ -564,11 +595,11 @@ class EditorSession:
                 element = added.get(uid)
             if not element or element.get("kind") != "text" or element.get("deleted"):
                 continue
-            wanted = _norm_text(element.get("text", ""))
+            wanted = _no_hyphens(element.get("text", ""))   # al partir una palabra se agrega un guion
             if not wanted:
                 continue
             if page_text is None:
-                page_text = _norm_text(doc[index].get_text("text"))
+                page_text = _no_hyphens(doc[index].get_text("text"))
             if wanted not in page_text:
                 failures[uid] = "el texto nuevo no quedó en la página"
                 continue
@@ -817,20 +848,7 @@ class EditorSession:
         como estaba (falta aceptar una fuente parecida); _Unsupported la deja para el
         camino anterior."""
         dx, dy = ov.get("dx", 0.0), ov.get("dy", 0.0)
-        lines = self._unit_lines(unit, index)
-        if unit.get("level") == "block":
-            new_lines = effective["text"].split("\n")
-            width = unit["bbox"][2] - unit["bbox"][0]
-            fits = len(new_lines) == len(lines) and all(
-                self._line_width(page_text, line, text) <= width * 1.02 + 1
-                for line, text in zip(lines, new_lines) if text != line["text"])
-            if fits:
-                plans = [self._plan_line(page_text, line, text, dx, dy, placement)
-                         for line, text in zip(lines, new_lines)]
-            else:
-                plans = [self._plan_reflow(page_text, unit, effective, lines, dx, dy, index)]
-        else:
-            plans = [self._plan_line(page_text, unit, effective["text"], dx, dy, placement)]
+        plans = self._text_plans(page_text, unit, effective, ov, dx, dy, placement, index)
 
         notes, boxes, pending, unaccepted = [], [], [], []
         for plan in plans:
@@ -893,15 +911,6 @@ class EditorSession:
             return None, None
         glyph = page_text.glyphs[gid]
         return glyph, page_text.op_of[gid]
-
-    def _line_width(self, page_text, line, text) -> float:
-        """Ancho (en la página) de `text` con la fuente del primer fragmento de la línea."""
-        for span in line["spans"]:
-            glyph, op = self._first_glyph(page_text, span)
-            if glyph is not None:
-                scale = _scale(op, glyph, page_text)
-                return sum(seg[2] for seg in self._segments(op, span, text, scale)) * scale
-        return 0.0
 
     def full_font(self, info, text: str):
         """La fuente completa para escribir `text` cuando la incrustada no alcanza: la misma
@@ -1028,53 +1037,33 @@ class EditorSession:
                 cursor += advance
         return plan
 
-    def _plan_reflow(self, page_text, unit, effective, lines, dx, dy, index):
-        """Párrafo con otro reparto de líneas: se quita entero y se vuelve a escribir con la
-        fuente y el estado de su primer fragmento, acomodado al ancho original."""
-        style = effective["style"]
-        span = next(s for line in lines for s in line["spans"] if any(g is not None for g in s["gids"]))
-        first, op = self._first_glyph(page_text, span)
-        scale = _scale(op, first, page_text)
-        width = (unit["bbox"][2] - unit["bbox"][0]) / scale    # en espacio de texto
-        start = fitz.Matrix(1, 0, 0, 1, first.x, 0) * op.tm
-        origin_x = (fitz.Point(0, op.state.ts) * start * op.state.ctm * page_text.page_tm).x
-        line_height = float(style.get("line_height") or style["size"] * 1.2)
-        align = style.get("align", "left")
-        plan = {"remove": self._unit_gids(unit, index), "runs": [], "boxes": []}
-
-        def measure(text):
-            return sum(seg[2] for seg in self._segments(op, span, text, scale))
-
-        n = 0
-        for paragraph in effective["text"].split("\n"):
-            rows, row = [], ""
-            for word in paragraph.split(" "):
-                trial = f"{row} {word}" if row else word
-                if row and measure(trial) > width:
-                    rows.append(row)
-                    row = word
-                else:
-                    row = trial
-            rows.append(row)
-            for k, text in enumerate(rows):
-                segments = self._segments(op, span, text, scale)
-                advance = sum(seg[2] for seg in segments)
-                offset = {"center": (width - advance) / 2, "right": width - advance}.get(align, 0.0)
-                extra = ((width - advance) / text.count(" ")
-                         if align == "justify" and k < len(rows) - 1 and " " in text else 0.0)
-                cursor = 0.0
-                for items, resolved, seg_adv, seg_text in segments:
-                    if extra:
-                        items = _justify(items, seg_text, extra)
-                        seg_adv += extra * seg_text.count(" ")
-                    shift_x = unit["bbox"][0] + (offset + cursor) * scale - origin_x
-                    tm = _moved(start, op.state.ctm, page_text.page_tm, dx + shift_x, dy + n * line_height)
-                    run = tops.Run(op.state, tm, items)
-                    plan["runs"].append((op, run, resolved, seg_text))
-                    plan["boxes"].append(_run_box(op, run, span, page_text, seg_adv))
-                    cursor += seg_adv
-                n += 1
-        return plan
+    def _text_plans(self, page_text, unit, effective, ov, dx, dy, placement, index):
+        """Qué escribir: solo lo que cambió. Con la misma cantidad de renglones y alineado a la
+        izquierda, cada línea conserva su inicio y sus fragmentos; si no, los renglones que
+        cambiaron se reescriben con el ancho del párrafo (pdf_flow)."""
+        lines = self._unit_lines(unit, index)
+        if abs((unit["style"].get("dir") or [1, 0])[1]) > 1e-3:   # texto girado: sin reacomodar
+            texts = effective["text"].split("\n")
+            if len(texts) != len(lines):
+                texts = [effective["text"]] + [""] * (len(lines) - 1)
+            return [self._plan_line(page_text, line, text, dx, dy, placement)
+                    for line, text in zip(lines, texts)]
+        zone = self._zone(index, unit, effective, ov)
+        if zone is None:
+            return [self._plan_line(page_text, line, line["text"], dx, dy, placement) for line in lines]
+        if len(zone.rows) == zone.old_count == 1 and unit.get("level") != "block":
+            return [self._plan_line(page_text, unit, effective["text"], dx, dy, placement)]
+        outside = [line for n, line in enumerate(lines) if not zone.first <= n < zone.stop]
+        plans = []
+        if abs(dx) > LIFT_EPS or abs(dy) > LIFT_EPS or placement != "inplace":
+            plans += [self._plan_line(page_text, line, line["text"], dx, dy, placement) for line in outside]
+        if len(zone.rows) == zone.old_count and zone.align == "left" \
+                and not any(row.hyphen for row in zone.rows):
+            for line, row in zip(lines[zone.first:zone.stop], zone.rows):
+                plans.append(self._plan_line(page_text, line, zone.row_text(row), dx, dy, placement))
+        elif zone.rows or zone.old_count:
+            plans.append(self._plan_zone(zone, dx, dy))
+        return plans
 
     # ------------------------------------------------------------------ información para la UI
 
@@ -1231,8 +1220,12 @@ class EditorSession:
                                 style.get("align", "left"), is_last)
         else:
             origin = unit["lines"][0]["origin"] if unit.get("lines") else unit["origin"]
-            for n, line in enumerate(text.split("\n")):
-                _append_words(writer, origin[0], origin[1] + n * size * 1.2, line, font, size)
+            # un texto que llegaría hasta el borde de la página sigue en el renglón siguiente
+            room = page.rect.x1 - max(36.0, min(72.0, origin[0])) - origin[0]
+            line_height = float(style.get("line_height") or size * 1.2)
+            rows = _wrap(text, font, size, room) if room > size * 4 else [(t, True) for t in text.split("\n")]
+            for n, (line, _is_last) in enumerate(rows):
+                _append_words(writer, origin[0], origin[1] + n * line_height, line, font, size)
         direction = style.get("dir") or [1, 0]
         morph = None
         if abs(direction[1]) > 1e-3:
@@ -1488,6 +1481,10 @@ def _effective(unit: dict, ov: dict) -> dict:
 def _norm_text(text: str) -> str:
     """Texto comparable: sin espacios ni saltos y con ligaduras separadas (ﬁ -> fi)."""
     return "".join(unicodedata.normalize("NFKC", text).split())
+
+
+def _no_hyphens(text: str) -> str:
+    return _norm_text(text).replace("-", "").replace("\u2010", "")
 
 
 def _has_ink(image, box, zoom: float, chars: int) -> bool:

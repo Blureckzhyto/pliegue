@@ -1,5 +1,13 @@
 # Cambios · Changelog
 
+## 1.4.1
+
+**Español**
+- Editar PDF: el texto que no cabe pasa al renglón siguiente y desplaza el contenido de abajo (o continúa en una página nueva).
+
+**English**
+- Edit PDF: text that no longer fits wraps onto the next line and pushes the content below down (or continues on a new page).
+
 ## 1.4.0
 
 **Español**

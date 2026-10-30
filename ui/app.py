@@ -30,7 +30,7 @@ except ImportError:
     class _Root(ctk.CTk):  # type: ignore[no-redef]
         dnd_available = False
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 VIEW_SLIDE_PX = 12
 THEMES = {"Claro": "claro", "Oscuro": "oscuro", "Sistema": "sistema"}
 THEME_ICONS = {"claro": "ui_sun", "oscuro": "ui_moon", "sistema": "ui_monitor"}

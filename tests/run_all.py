@@ -23,9 +23,9 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SUITES = [
     "regression_existing", "core_editsign_test", "core_new_tools_test", "editor_core_test",
-    "core_v131_test", "editor_v132_test", "editor_v134_test", "editor_v135_test",
+    "core_v131_test", "editor_v132_test", "editor_v134_test", "editor_v135_test", "editor_v141_test",
     "gui_v12_test", "gui_v13_editor_test", "gui_v131_test", "gui_v132_test",
-    "gui_v133_nombre_test", "gui_v134_test", "gui_v136_test", "gui_v137_editor_test", "gui_about_test",
+    "gui_v133_nombre_test", "gui_v134_test", "gui_v136_test", "gui_v137_editor_test", "gui_v141_test", "gui_about_test",
     "migration_test",
 ]
 

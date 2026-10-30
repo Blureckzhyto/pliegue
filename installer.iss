@@ -3,7 +3,7 @@
 ; Produce installer\Pliegue_Setup.exe
 
 #define MyAppName "Pliegue"
-#define MyAppVersion "1.4.0"
+#define MyAppVersion "1.4.1"
 ; Debe coincidir con ui/startup.py: une los accesos directos y la ventana en un solo botón de la barra de tareas
 #define MyAppUserModelID "Pliegue.App"
 #define MyAppPublisher "Blureckzhyto"
