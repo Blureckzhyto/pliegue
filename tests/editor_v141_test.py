@@ -212,17 +212,32 @@ with fitz.open(stream=page_new.data, filetype="pdf") as doc:
                                                                for l in lines_two) and lines_two)
     margin_top = min(l["bbox"][1] for l in lines_two)
     check("página nueva: mismo margen de arriba", abs(margin_top - s.analyze(0)["lines"][0]["bbox"][1]) < 3, f"{margin_top:.1f}")
-shrink = result.candidates.get("shrink")
-if shrink:
-    with fitz.open(stream=shrink.data, filetype="pdf") as doc:
-        sizes = {round(span["size"], 2) for block in doc[0].get_text("dict")["blocks"] for line in block.get("lines", [])
-                 for span in line["spans"]}
-    check("reducir letra: al menos 85 %", min(sizes) >= 11 * 0.85 - 0.01 and doc.is_closed, str(sorted(sizes)))
-    check("reducir letra: sin páginas nuevas", shrink.added_pages == 0)
-    check("reducir letra: muestra el tamaño", "pt" in shrink.message, shrink.message)
-tighten = result.candidates.get("tighten")
-if tighten:
-    check("interlineado: sin páginas nuevas", tighten.added_pages == 0, tighten.message)
+# lo justo para que no quepa: así las opciones que reducen sí alcanzan
+block = next(b for b in s.analyze(0)["blocks"] if "Parrafo 02" in b["text"])
+flowed = s.flow_text(0, block["id"])
+close = None
+for count in range(5, 400, 5):
+    close = edit(s, block["id"], flowed + " palabra" * count)
+    if close.status == "overflow":
+        break
+check("hay una edición que apenas no cabe", close.status == "overflow", f"{count} palabras")
+shrink = close.candidates.get("shrink")
+check("se ofrece reducir la letra", shrink is not None, str(sorted(close.candidates)))
+with fitz.open(stream=shrink.data, filetype="pdf") as doc:
+    sizes = {round(span["size"], 2) for b in doc[0].get_text("dict")["blocks"] for line in b.get("lines", [])
+             for span in line["spans"]}
+check("reducir letra: al menos 85 %", min(sizes) >= 11 * 0.85 - 0.01, str(sorted(sizes)))
+check("reducir letra: solo el párrafo editado", 11.0 in sizes and len(sizes) == 2, str(sorted(sizes)))
+check("reducir letra: sin páginas nuevas", shrink.added_pages == 0)
+check("reducir letra: muestra el tamaño", "pt" in shrink.message, shrink.message)
+tighten = close.candidates.get("tighten")
+check("se ofrece reducir el interlineado", tighten is not None, str(sorted(close.candidates)))
+check("interlineado: sin páginas nuevas", tighten.added_pages == 0, tighten.message)
+with fitz.open(stream=tighten.data, filetype="pdf") as doc:
+    rows = sorted({round(line["spans"][0]["origin"][1], 2) for b in doc[0].get_text("dict")["blocks"]
+                   for line in b.get("lines", []) if "palabra" in "".join(sp["text"] for sp in line["spans"])})
+gaps = [b - a for a, b in zip(rows, rows[1:])]
+check("interlineado: nunca menos que el tamaño de letra", gaps and min(gaps) >= 11 - 0.05, str(gaps[:4]))
 target_huge = {"text": target["text"] + " " + "contenido adicional " * 400}
 result = edit(s, target["id"], target_huge["text"])
 check("mucho texto: el 85 % no alcanza y no se ofrece", "shrink" not in result.candidates, str(sorted(result.candidates)))
@@ -282,6 +297,93 @@ _image, layout, _notes = s.render_page(0, state, 1.0, verify=[line_with(s, "DOCE
 check("portada: se puede volver a editar", True)
 words = s.doc[0].get_text()
 check("portada: nada duplicado", words.count("MATERIA") == 1 and words.count("GRUPO") == 1)
+s.close()
+
+print("== enlaces y anotaciones")
+
+
+def annots(data, index=0):
+    with fitz.open(stream=data, filetype="pdf") as doc:
+        page = doc[index]
+        links = {l.get("uri"): fitz.Rect(l["from"]) for l in page.get_links()}
+        notes = {a.type[1]: fitz.Rect(a.rect) for a in page.annots()}
+        quads = [a.vertices for a in page.annots() if a.type[1] == "Highlight"]
+        return links, notes, quads
+
+
+pdf = fixtures.reflow_annots(TMP / "anotaciones.pdf")
+s = pdf_editor.EditorSession(pdf)
+links, notes, quads = annots(s.data)
+target = line_with(s, "Primer parrafo")
+result = edit(s, target["id"], target["text"] + " " + "mas texto " * 40)
+check("anotaciones: aplica", result.status == "done", result.status)
+links2, notes2, quads2 = annots(result.data)
+D = result.shift
+up, down = "https://example.com/arriba", "https://example.com/abajo"
+check("el enlace de arriba no se mueve", abs(links2[up].y0 - links[up].y0) < 0.01)
+check("el enlace de abajo baja exacto", abs(links2[down].y0 - links[down].y0 - D) <= 0.5,
+      f"{links[down].y0:.1f} → {links2[down].y0:.1f}, {D} pt")
+check("conserva su destino y su tamaño", abs(links2[down].width - links[down].width) < 0.01)
+check("la nota baja exacto", abs(notes2["Text"].y0 - notes["Text"].y0 - D) <= 0.5)
+check("el resaltado baja exacto", abs(notes2["Highlight"].y0 - notes["Highlight"].y0 - D) <= 0.5)
+check("con sus cuadrilateros", abs(quads2[0][0][1] - quads[0][0][1] - D) <= 0.5)
+s.close()
+pdf = fixtures.reflow_annots(TMP / "anotaciones2.pdf")
+s = pdf_editor.EditorSession(pdf)
+target = line_with(s, "Primer parrafo")
+result = edit(s, target["id"], target["text"] + " " + "mas texto " * 330)
+check("página nueva: aplica", result.status == "overflow", result.status)
+data = result.candidates["newpage"].data
+with fitz.open(stream=data, filetype="pdf") as doc:
+    found = [i for i in range(doc.page_count) for l in doc[i].get_links() if l.get("uri") == down]
+    text_on = [i for i in range(doc.page_count) if "Texto final" in doc[i].get_text()]
+check("el enlace sigue a su texto a la página nueva", found and found == text_on and found[0] > 0, f"{found} {text_on}")
+s.close()
+
+print("== imagen al lado que cruza la línea de corte")
+pdf = fixtures.reflow_beside(TMP / "al_lado.pdf")
+s = pdf_editor.EditorSession(pdf)
+original = s.data
+image = s.analyze(0)["images"][0]["bbox"]
+target = line_with(s, "Linea 3")
+below = line_with(s, "Linea debajo")["bbox"][1]
+final = line_with(s, "Texto final")["bbox"][1]
+check("el corte pasa por la imagen", image[1] < target["bbox"][3] < image[3])
+area = s.text_area(0, target)
+check("el texto no se mete en la imagen", area["right"] <= image[0] - 1, f"{area['right']:.1f} < {image[0]:.1f}")
+result = edit(s, target["id"], target["text"] + " y aqui sigue un texto bastante mas largo que ya no cabe en esta linea")
+check("imagen al lado: aplica", result.status == "done", result.status)
+s.adopt(result.data)
+after = s.analyze(0)
+check("la imagen queda entera y en su lugar", len(after["images"]) == 1
+      and all(abs(a - b) < 0.01 for a, b in zip(after["images"][0]["bbox"], image)),
+      str([round(v, 1) for v in after["images"][0]["bbox"]]))
+ok, worst = same_region(original, result.data, 0, image[1], image[3], x0=image[0] - 1, x1=image[2] + 1)
+check("la imagen se ve idéntica", ok, f"diferencia máxima {worst}")
+check("lo de abajo sí baja", abs(line_with(s, "Linea debajo")["bbox"][1] - below - result.shift) <= 0.5
+      and abs(line_with(s, "Texto final")["bbox"][1] - final - result.shift) <= 0.5)
+check("los renglones nuevos no pisan la imagen", all(l["bbox"][2] <= image[0] + 0.5 for l in after["lines"]),
+      str(max(round(l["bbox"][2], 1) for l in after["lines"])))
+s.close()
+
+print("== línea corta en una página con poco texto")
+pdf = fixtures.reflow_beside(TMP / "corta.pdf")
+s = pdf_editor.EditorSession(pdf)
+import reportlab.pdfgen.canvas as rl_canvas  # noqa: E402
+
+short = TMP / "corta2.pdf"
+c = rl_canvas.Canvas(str(short), pagesize=(595, 842))
+c.setFont("Helvetica-Bold", 16)
+c.drawString(72, 700, "CARRERA: INGENIERIA EN SISTEMAS")
+c.setFont("Helvetica", 12)
+c.drawString(72, 660, "Texto de prueba normal")
+c.save()
+s.close()
+s = pdf_editor.EditorSession(short)
+target = line_with(s, "CARRERA")
+ov = {"text": target["text"] + "x"}
+check("una letra más no parte la línea", not s.needs_reflow(0, target["id"], ov, True, False))
+check("el margen derecho es como el izquierdo", abs(s.columns(0)[0][1] - (595 - 72)) < 1, str(s.columns(0)))
 s.close()
 
 print("== nada se cancela en silencio")

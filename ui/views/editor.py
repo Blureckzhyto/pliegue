@@ -1115,23 +1115,31 @@ class PdfEditorView(ToolView):
         room = self._edit_room(uid, element, origin)
         base_x = min(origin[0], room["rest_x"])
         left = MARGIN + base_x * s
-        block_width = max(20, (room["right"] - base_x) * s)   # hasta donde llega un renglón
+        # Tk solo usa tamaños enteros y mide un poco más ancho que el PDF: sin esta corrección, una
+        # línea llena se vería partida en dos con solo abrirla
+        widths = [font.measure(l["text"]) / max(1.0, (l["bbox"][2] - l["bbox"][0]) * s)
+                  for l in element.get("lines", []) if l.get("text")]
+        ratio = min(1.08, max([1.0] + widths))
+        block_width = max(20, (room["right"] - base_x) * s * ratio) + 4   # + el cursor al final
         widget = tk.Text(self.ed_canvas, wrap="word", font=font,
                          fg=style["color"], bg=self._sample_bg(box), insertbackground=style["color"],
                          relief="flat", bd=0, highlightthickness=0, padx=0, pady=0, undo=True,
                          spacing1=0, spacing3=0,
                          spacing2=max(0, int(line_px - font.metrics("linespace"))))
 
-        def fit(_event=None):
+        def fit(_event=None, settled=True):
             """El cuadro crece con el texto: a lo ancho hasta el borde del párrafo y, de ahí en
-            adelante, hacia abajo, como quedará al confirmar."""
+            adelante, hacia abajo, como quedará al confirmar. Al abrirlo (`settled` falso) no se
+            fuerza a dibujarse: el foco se le da al mostrarse, después del aviso de activación de
+            la ventana; dibujado antes, ese aviso le devolvería el foco al lienzo."""
             if not widget.winfo_exists():
                 return
             rows = widget.get("1.0", "end-1c").split("\n")
             indent = (origin[0] - base_x) * s
             width = block_width if is_block else min(block_width, max(font.measure(r) for r in rows) + indent + 4)
             self.ed_canvas.itemconfigure("editor", width=max(8, width))
-            widget.update_idletasks()
+            if settled:
+                widget.update_idletasks()
             counted = widget.count("1.0", "end", "displaylines")
             count = max(len(rows), counted[0] if counted else 1)
             height = font.metrics("linespace") + (count - 1) * line_px + 2
@@ -1146,7 +1154,8 @@ class PdfEditorView(ToolView):
         self.ed_canvas.create_window(left, top, anchor="nw", window=widget, tags="editor")
         self.ed_editor = (widget, uid, font)
         self.ed_editor_shown = shown     # el texto con que se abrió (para saber si cambió)
-        fit()
+        fit(settled=False)
+        widget.after_idle(fit)
         widget.bind("<KeyRelease>", fit, add="+")
         widget.bind("<<Paste>>", lambda _e: widget.after_idle(fit), add="+")
         widget.focus_force()

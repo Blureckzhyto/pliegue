@@ -152,3 +152,43 @@ def reflow_justified(path: Path) -> Path:
     SimpleDocTemplate(str(path), pagesize=A4, leftMargin=72, rightMargin=72, topMargin=72, bottomMargin=72).build(
         [Paragraph(LOREM * 4, s["just"]), Paragraph("Segundo parrafo. " + LOREM * 2, s["just"])])
     return path
+
+
+def reflow_annots(path: Path) -> Path:
+    """La página de reflow_page con un enlace arriba, un enlace y una nota abajo y un resaltado."""
+    import fitz
+
+    plain = Path(path).with_name(Path(path).stem + "_base.pdf")
+    reflow_page(plain)
+    doc = fitz.open(plain)
+    page = doc[0]
+    top = page.search_for("Informe trimestral")[0]
+    below = page.search_for("Texto final")[0]
+    heading = page.search_for("Resultados por region")[0]
+    page.insert_link({"kind": fitz.LINK_URI, "from": top, "uri": "https://example.com/arriba"})
+    page.insert_link({"kind": fitz.LINK_URI, "from": below, "uri": "https://example.com/abajo"})
+    page.add_text_annot(fitz.Point(heading.x1 + 20, heading.y0), "Nota de prueba")
+    page.add_highlight_annot(heading)
+    doc.save(path)
+    doc.close()
+    return path
+
+
+def reflow_beside(path: Path) -> Path:
+    """Un párrafo angosto con una imagen a la derecha que empieza más arriba y termina más abajo:
+    cruza la línea de corte."""
+    from reportlab.pdfgen import canvas
+
+    picture = _picture(Path(path).with_suffix(".png"))
+    c = canvas.Canvas(str(path), pagesize=(595, 842))
+    c.setFont("Helvetica", 11)
+    y = 720
+    for n in range(6):
+        c.drawString(72, y, f"Linea {n + 1} del parrafo junto a la imagen, con su texto.")
+        y -= 14
+    y -= 14
+    c.drawString(72, y, "Linea debajo del parrafo, todavia al lado de la imagen.")
+    c.drawImage(str(picture), 380, 560, width=150, height=180)
+    c.drawString(72, 500, "Texto final de la pagina.")
+    c.save()
+    return path

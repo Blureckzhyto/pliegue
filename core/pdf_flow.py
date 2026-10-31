@@ -128,7 +128,16 @@ class FlowMixin:
     def columns(self, index: int) -> list:
         model = self.analyze(index)
         if "columns" not in model:
-            model["columns"] = flow.detect_columns([l["bbox"] for l in model["lines"]], model["width"])
+            width = model["width"]
+            columns = flow.detect_columns([l["bbox"] for l in model["lines"]], width)
+            if len(columns) == 1:
+                # con poco texto en la página, sus líneas no marcan el margen derecho: se usa
+                # el mismo margen que a la izquierda (si no, una letra más ya partiría la línea)
+                x0, x1 = columns[0]
+                margin = min(x0, width - x1)
+                margin = 72.0 if margin > width * 0.2 else margin
+                columns = [(min(x0, margin), max(x1, width - margin))]
+            model["columns"] = columns
         return model["columns"]
 
     def _column_of(self, index: int, box) -> tuple:
@@ -704,8 +713,9 @@ class FlowMixin:
             numbers = [float(v) for v in value.strip("[]").split()]
             box = fitz.Rect(numbers) * page_text.page_tm
             box.normalize()
+            overlap = min(box.x1, column[1]) - max(box.x0, column[0])
             if box.y0 < split - flow.SPLIT_TOL or (footer is not None and box.y0 >= footer - 1) \
-                    or not (column[0] - 2 <= box.x0 and box.x1 <= column[1] + 2):
+                    or overlap < box.width * 0.5:      # un resaltado sobresale un poco de su texto
                 continue
             where = None
             for band, spot in zip(bands, placed.bands):

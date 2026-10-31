@@ -123,11 +123,12 @@ def steps():
     original = v.ed_session.data
     pages = v.ed_session.page_count
 
-    def type_long():
-        v._select(line["id"])
-        v._begin_edit(line["id"])
+    def type_long(extra=" contenido adicional" * 40, uid=None):
+        uid = uid or line["id"]
+        v._select(uid)
+        v._begin_edit(uid)
         widget = v.ed_editor[0]
-        widget.insert("end-1c", " contenido adicional" * 40)
+        widget.insert("end-1c", extra)
         v._commit_edit()
         d.wait(lambda: v.ed_overflow_dialog is not None or not v.ed_reflowing, 30)
         d.wait(lambda: v.ed_overflow_dialog is not None, 30)
@@ -154,17 +155,40 @@ def steps():
     d.rendered()
     check("deshacer quita la página nueva", v.ed_session.page_count == pages and len(v.ed_order) == pages
           and v.ed_session.data is original)
-    dialog = type_long()
-    if dialog.ed_radios["shrink"].cget("state") == "normal":
-        dialog.ed_radios["shrink"].invoke()
-        d.settle(200)
-        check("la vista previa cambia con la opción", dialog.ed_choice.get() == "shrink")
-        dialog.ed_buttons["apply"].invoke()
-        d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
-        d.rendered()
-        check("reducir letra aplica sin página nueva", v.ed_session.page_count == pages, v.status.cget("text"))
-    else:
-        dialog.ed_buttons["cancel"].invoke()
+    # en modo Párrafo y con lo justo para que no quepa: así reducir la letra sí alcanza (en modo
+    # Línea solo se reduce esa línea y casi no se gana espacio)
+    v._set_level("block")
+    block_id = line["block_id"]
+    extra = None
+    flowed = v.ed_session.flow_text(0, block_id)
+    for count in range(5, 300, 5):
+        state = {"overrides": {block_id: {"text": flowed + " palabra" * count}}, "added": [], "z": None}
+        attempt = v.ed_session.reflow(0, state, block_id)
+        if attempt.status == "overflow":
+            extra = " palabra" * count
+            break
+    check("hay un texto que apenas no cabe", extra is not None and "shrink" in attempt.candidates,
+          str(sorted(attempt.candidates)) if extra else "")
+    dialog = type_long(extra, block_id)
+    check("la opción de reducir letra está disponible", dialog.ed_radios["shrink"].cget("state") == "normal")
+    first_preview = list(dialog.ed_photos.get("newpage", []))
+    dialog.ed_radios["shrink"].invoke()
+    d.settle(250)
+    check("elegir la opción cambia la selección", dialog.ed_choice.get() == "shrink")
+    check("la vista previa pasa a esa opción", bool(dialog.ed_photos.get("shrink")) and bool(first_preview))
+    dialog.ed_buttons["apply"].invoke()
+    d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
+    d.rendered()
+    status = v.status.cget("text")
+    check("reducir letra aplica sin página nueva", v.ed_session.page_count == pages, status)
+    check("dice el tamaño que quedó", " pt (" in status and "%" in status, status)
+    sizes = {round(float(l["style"]["size"]), 2) for l in v._model()["lines"]}
+    check("el tamaño no baja del 85 %", min(sizes) >= 11 * 0.85 - 0.01 and 11.0 in sizes, str(sorted(sizes)))
+    v._undo()
+    d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
+    d.rendered()
+    check("deshacer devuelve el tamaño original", v.ed_session.data is original)
+    v._set_level("line")
     out = TMP / "resultado.pdf"
     state = v.ed_states.get(0)
     v.ed_session.save(out, {0: state} if state else {}, list(range(v.ed_session.page_count)), {})

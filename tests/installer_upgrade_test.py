@@ -1,4 +1,4 @@
-"""Instalador de Pliegue 1.4.0 sobre una instalación de PDFKit 1.3.7 (el nombre anterior).
+"""Instalador de la versión actual sobre una instalación de PDFKit 1.3.7 (el nombre anterior).
 
 NO toca la instalación ni los datos del usuario: compila variantes de los instaladores con
 OTRO AppId y otros nombres ("PDFKit Prueba" -> "Pliegue Prueba"), instala por usuario en una
@@ -17,6 +17,7 @@ la desinstalación no deja nada.
 import ctypes
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,7 @@ import measure_startup  # noqa: E402
 
 ISCC = Path(os.environ["LOCALAPPDATA"]) / "Programs" / "Inno Setup 6" / "ISCC.exe"
 TEST_GUID = "3B1F6C2A-9D4E-4F7A-8C21-5E0D7A9B4C66"
+VERSION = re.search(r'VERSION = "([^"]+)"', (ROOT / "ui" / "app.py").read_text(encoding="utf-8")).group(1)
 OLD_NAME, NEW_NAME = "PDFKit Prueba", "Pliegue Prueba"
 OLD_DIST = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "tests" / "_capturas" / "PDFKit_1.3.7_dist"
 WORK = Path(tempfile.mkdtemp(prefix="pliegue_instalador_", dir=ROOT / "tests" / "_capturas"))
@@ -159,8 +161,8 @@ try:
     before = uninstall_entries()
     check("1.3.7: una entrada en Agregar o quitar programas", len(before) == 1, str(before))
 
-    # --- Pliegue 1.4.0 encima
-    check("instala Pliegue 1.4.0 encima", install(new_setup, NEW_DIR) == 0)
+    # --- Pliegue encima
+    check(f"instala Pliegue {VERSION} encima", install(new_setup, NEW_DIR) == 0)
     exe = NEW_DIR / "Pliegue.exe"
     check("la carpeta nueva está completa (Pliegue.exe, _internal, Licencias)",
           exe.exists() and len(list((NEW_DIR / "_internal").rglob("*"))) > 1000
@@ -172,7 +174,7 @@ try:
     check("una sola entrada en Agregar o quitar programas, con el nombre nuevo",
           len(after) == 1 and entry.get("DisplayName") == NEW_NAME, str(after))
     check("con la versión y la carpeta nuevas y el publicador",
-          entry.get("DisplayVersion") == "1.4.0" and Path(entry.get("InstallLocation", ".")).resolve() == NEW_DIR.resolve()
+          entry.get("DisplayVersion") == VERSION and Path(entry.get("InstallLocation", ".")).resolve() == NEW_DIR.resolve()
           and entry.get("Publisher") == "Blureckzhyto", str(entry))
     check("los accesos directos viejos se borraron", not any(p.exists() for p in old_links)
           and not (start_menu / OLD_NAME).exists())
