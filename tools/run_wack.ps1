@@ -3,7 +3,8 @@
 # WACK necesita permisos de administrador: Windows pide confirmarlo (UAC). El reporte queda en
 # build\msix\wack.xml y abajo se imprime el resumen (resultado de cada prueba y sus mensajes).
 $root = Split-Path -Parent $PSScriptRoot
-$msix = Join-Path $root "build\msix\Pliegue_1.4.0.0_x64_prueba_firmado.msix"
+$version = [regex]::Match((Get-Content (Join-Path $root "ui\app.py") -Raw -Encoding UTF8), 'VERSION = "([^"]+)"').Groups[1].Value
+$msix = Join-Path $root "build\msix\Pliegue_$version.0_x64_prueba_firmado.msix"
 $report = Join-Path $root "build\msix\wack.xml"
 $appcert = "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe"
 if (-not (Test-Path $msix)) { throw "No existe $msix (py -3.11 tools\build_msix.py --firmar-prueba)" }
