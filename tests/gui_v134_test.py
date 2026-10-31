@@ -134,7 +134,10 @@ def run():
               f"cuadro {width:.0f}, texto {text_w}, línea {line_w:.0f}")
         check(f"{zoom}: sin borde ni resaltado del cuadro", int(widget.cget("highlightthickness")) == 0
               and int(widget.cget("bd")) == 0 and int(widget.cget("padx")) == 0)
-        check(f"{zoom}: un solo recuadro de selección", len(v.ed_canvas.find_withtag("overlay")) == 1)
+        # además del recuadro están los 6 tiradores de ancho (rellenos, los del recuadro no)
+        drawn = v.ed_canvas.find_withtag("overlay")
+        frames = [i for i in drawn if not v.ed_canvas.itemcget(i, "fill")]
+        check(f"{zoom}: un solo recuadro de selección", len(frames) == 1 and len(drawn) == 7, str(len(drawn)))
         actual = font.actual()
         check(f"{zoom}: el cuadro muestra Montserrat negrita", actual["family"] == "Montserrat"
               and actual["weight"] == "bold", str(actual))
