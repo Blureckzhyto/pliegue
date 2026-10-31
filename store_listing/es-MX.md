@@ -60,12 +60,13 @@ SOFTWARE LIBRE
 Pliegue es gratis y de código abierto (licencia AGPL-3.0). Código fuente: https://github.com/Blureckzhyto/pliegue
 ```
 
-## Novedades de esta versión (1.4.0)
+## Novedades de esta versión (1.4.1)
 
 ```
-Primera versión en la Microsoft Store.
-• PDFKit ahora se llama Pliegue: mismo programa, nombre y logo nuevos.
-• Si ya usabas PDFKit o Pliegue con el instalador, la versión de la Store toma tu configuración la primera vez que la abres (sin modificar la otra instalación).
+Novedades en Editar PDF:
+• El texto que no cabe pasa al renglón siguiente y desplaza el contenido de abajo.
+• Si ya no cabe en la página, puedes continuar en una página nueva o reducir un poco la letra o el interlineado, con vista previa.
+• Puedes deshacer todo el cambio de un solo paso.
 ```
 
 ## Características del producto (una por línea; hasta 20)

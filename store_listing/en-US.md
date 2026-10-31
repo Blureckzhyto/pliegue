@@ -62,12 +62,13 @@ FREE SOFTWARE
 Pliegue is free and open source (AGPL-3.0 license). Source code: https://github.com/Blureckzhyto/pliegue
 ```
 
-## What's new in this version (1.4.0)
+## What's new in this version (1.4.1)
 
 ```
-First release on the Microsoft Store.
-• PDFKit is now called Pliegue: same app, new name and logo.
-• If you already used PDFKit or Pliegue from the installer, the Store version picks up your settings the first time you open it (without changing the other installation).
+What's new in Edit PDF:
+• Text that no longer fits wraps onto the next line and pushes the content below down.
+• If it no longer fits on the page, continue on a new page or slightly reduce the font size or line spacing, with a preview.
+• Undo the whole change in one step.
 ```
 
 ## Product features (one per line; up to 20)
