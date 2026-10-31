@@ -67,6 +67,7 @@ Pliegue is free and open source (AGPL-3.0 license). Source code: https://github.
 ```
 What's new in Edit PDF:
 • Text that no longer fits wraps onto the next line and pushes the content below down.
+• You can widen or narrow the text box and the text rearranges itself.
 • If it no longer fits on the page, continue on a new page or slightly reduce the font size or line spacing, with a preview.
 • Undo the whole change in one step.
 ```

@@ -4,9 +4,11 @@
 
 **Español**
 - Editar PDF: el texto que no cabe pasa al renglón siguiente y desplaza el contenido de abajo (o continúa en una página nueva).
+- Editar PDF: puedes ensanchar o angostar el cuadro de texto y el texto se acomoda solo.
 
 **English**
 - Edit PDF: text that no longer fits wraps onto the next line and pushes the content below down (or continues on a new page).
+- Edit PDF: you can widen or narrow the text box and the text rearranges itself.
 
 ## 1.4.0
 

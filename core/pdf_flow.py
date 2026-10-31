@@ -63,6 +63,8 @@ class Zone:
     font: object = None      # fuente de PyMuPDF si no se escribe con la del PDF
     font_scale: float = 1.0
     style: dict | None = None
+    box: list | None = None  # ancho elegido por el usuario: [izquierda, derecha]
+    shift: float = 0.0       # cuánto se movió el borde izquierdo
 
     def row_text(self, row) -> str:
         return self.text[row.start:row.end] + ("-" if row.hyphen else "")
@@ -84,7 +86,7 @@ class Zone:
     def row_x(self, n: int) -> float:
         j = self.first + n
         if j < len(self.lines):
-            return self.lines[j]["lines"][0]["origin"][0]
+            return self.lines[j]["lines"][0]["origin"][0] + self.shift
         return self.area["rest_x"]
 
     def row_width(self, n: int) -> float:
@@ -165,10 +167,15 @@ class FlowMixin:
         line_height = float(own[0]["style"].get("line_height") or own[0]["style"]["size"] * 1.2)
         ids = {l["id"] for l in block}
         low = box[3] + 2 * line_height
+        limit_left, limit_right = column
         for other in [l for l in model["lines"] if l["id"] not in ids] + model["images"]:
             b = other["bbox"]
-            if b[1] < low and b[3] > box[1] and b[0] >= box[2] - 1:   # está a la derecha, a esa altura
-                right = min(right, b[0] - 6)
+            if b[1] < low and b[3] > box[1]:     # a esa altura, a un lado
+                if b[0] >= box[2] - 1:
+                    right = min(right, b[0] - 6)
+                    limit_right = min(limit_right, b[0] - 6)
+                elif b[2] <= box[0] + 1:
+                    limit_left = max(limit_left, b[2] + 6)
         right = max(right, box[2])
         x0 = own[0]["lines"][0]["origin"][0]
         if len(block) >= 2:
@@ -187,7 +194,8 @@ class FlowMixin:
             elif left_gap > 12 and right_gap < 2:
                 align = "right"
         return {"left": min(box[0], x0), "right": right, "rest_x": rest_x, "column": column,
-                "align": align, "block": block}
+                "align": align, "block": block, "limit_left": min(limit_left, box[0]),
+                "limit_right": max(limit_right, box[2])}
 
     @staticmethod
     def _hanging_x(line) -> float | None:
@@ -244,14 +252,59 @@ class FlowMixin:
             return None
         return self._old_flow(lines, self.text_area(index, unit))[0]
 
-    def edit_geometry(self, index: int, uid: str) -> dict | None:
+    def edit_geometry(self, index: int, uid: str, ov: dict | None = None) -> dict | None:
         """Para el cuadro de edición en el lugar: dónde se puede extender el texto."""
         model = self.analyze(index)
         unit = next((u for u in model["blocks"] + model["lines"] if u["id"] == uid), None)
         if unit is None or model["ocr"]:
             return None
         area = self.text_area(index, unit)
+        box = (ov or {}).get("box")
+        if box:
+            return {"right": box[1], "rest_x": area["rest_x"] + box[0] - area["left"], "align": area["align"]}
         return {"right": area["right"], "rest_x": area["rest_x"], "align": area["align"]}
+
+    def width_limits(self, index: int, uid: str, ov: dict | None = None, element: dict | None = None) -> dict:
+        """Cuánto se puede ensanchar o angostar un texto: {left, right, min_width}. Lo más ancho
+        es la columna (o lo que el texto tenga al lado); lo más angosto, su palabra más larga."""
+        pe = _pe()
+        model = self.analyze(index)
+        unit = next((u for u in model["blocks"] + model["lines"] if u["id"] == uid), None)
+        ov = ov or {}
+        if unit is None:                 # texto agregado
+            style = element["style"]
+            box = element.get("box") or element["bbox"]
+            column = self._column_of(index, (box[0], box[1], box[0] + 1, box[1] + 1))
+            left, right = column[0], max(column[1], element["bbox"][2])
+            words = re.findall(r"\S+", element.get("text", "")) or ["A"]
+            font = self.resolve_font(style, "".join(words))[0]
+            size = float(style["size"])
+            width = max(font.text_length(w, fontsize=size) for w in words)
+            return {"left": min(left, box[0]), "right": right, "min_width": max(width, size)}
+        area = self.text_area(index, unit)
+        effective = pe._effective(unit, ov)
+        words = sorted(set(re.findall(r"\S+", effective["text"])), key=len, reverse=True)[:12] or ["A"]
+        size = float(unit["style"]["size"])
+        lines = self._unit_lines(unit, index)
+        spans = [s for line in lines for s in line.get("spans") or []]
+        width = 0.0
+        page_text = self._texts.get(index)
+        for word in words:
+            try:
+                width = max(width, self._span_width(spans, 0, word, page_text, 1.0, {}))
+            except Exception:
+                width = max(width, len(word) * size * 0.6)
+        return {"left": area["limit_left"], "right": area["limit_right"], "min_width": max(width + 1, size)}
+
+    def preview_width(self, index, state, uid, zoom, push=True, adjust=False):
+        """Imagen de la página mientras se arrastra un tirador: con lo de abajo ya desplazado
+        si cabe; si no cabe (lo decide el diálogo al soltar), el texto sin desplazar."""
+        ov = state.get("overrides", {}).get(uid)
+        if ov is not None and self.needs_reflow(index, uid, ov, push, adjust):
+            result = self.reflow(index, state, uid, push, adjust, quick=True)
+            if result.status == "done":
+                return _previews(result.data, index, 0, zoom)[0]
+        return self.render_page(index, state, zoom)[0]
 
     # ------------------------------------------------------------------ renglones nuevos
 
@@ -281,6 +334,11 @@ class FlowMixin:
         if not lines:
             return None
         area = self.text_area(index, unit)
+        box = ov.get("box")
+        shift = 0.0
+        if box:
+            shift = box[0] - area["left"]
+            area = dict(area, left=box[0], right=box[1], rest_x=area["rest_x"] + shift)
         style = effective["style"]
         new = effective["text"]
         size = float(style["size"]) * font_scale
@@ -300,7 +358,7 @@ class FlowMixin:
         limit = min(len(old_n), len(new_n))
         while p < limit and old_n[p] == new_n[p]:
             p += 1
-        if p == len(old_n) == len(new_n) and old.count("\n") == new.count("\n"):
+        if p == len(old_n) == len(new_n) and old.count("\n") == new.count("\n") and not box:
             return None
         s = 0
         while s < limit - p and old_n[-1 - s] == new_n[-1 - s]:
@@ -309,7 +367,8 @@ class FlowMixin:
         if src:     # lo insertado toma el estilo del carácter anterior
             inherited = src[p - 1] if p else src[0]
             new_src = src[:p] + [inherited] * (len(new) - p - s) + (src[len(src) - s:] if s else [])
-        whole = font_scale != 1.0 or line_height is not None   # reducir: el párrafo entero
+        # reducir o cambiar el ancho afecta al párrafo entero
+        whole = font_scale != 1.0 or line_height is not None or box is not None
         first = 0 if whole else max((j for j, start in enumerate(starts) if start <= p), default=0)
         font = None
         page_text = self._texts.get(index)
@@ -334,14 +393,15 @@ class FlowMixin:
         def converge(position):
             return None if whole else suffixes.get(new_n[position:])
 
-        x_first = lines[first]["lines"][0]["origin"][0]
-        x_rest = lines[first + 1]["lines"][0]["origin"][0] if first + 1 < len(lines) else area["rest_x"]
+        x_first = lines[first]["lines"][0]["origin"][0] + shift
+        x_rest = lines[first + 1]["lines"][0]["origin"][0] + shift if first + 1 < len(lines) else area["rest_x"]
         hyphen = measure_hyphen(font, size, spans, page_text, self, font_scale)
         rows, stop = flow.wrap_rows(new, measure, area["right"] - x_first, area["right"] - x_rest,
-                                    starts[first], hyphen, converge)
+                                    starts[first], hyphen, converge,
+                                    flow.EXACT_TOL if box else flow.WIDTH_TOL)
         stop = len(lines) if stop is None else stop
         zone = Zone(index, lines, first, stop, rows, new, new_src, spans, area, height, align, font,
-                    font_scale, style)
+                    font_scale, style, box, shift)
         if not whole:
             while zone.rows and zone.first < zone.stop \
                     and zone.row_text(zone.rows[0]) == lines[zone.first]["text"]:
@@ -809,7 +869,7 @@ class FlowMixin:
             return session, block, []
         return session, found, []
 
-    def reflow(self, index, state, uid, push=True, adjust=False, accept_all=False) -> ReflowResult:
+    def reflow(self, index, state, uid, push=True, adjust=False, accept_all=False, quick=False) -> ReflowResult:
         """Aplica una edición que cambia la cantidad de renglones. Si no cabe en la página,
         devuelve `overflow` con el resultado de cada opción ya calculado (para la vista previa).
         No cambia la sesión: el resultado se adopta con `adopt`."""
@@ -819,12 +879,12 @@ class FlowMixin:
         if pending:
             return ReflowResult("pending", pending=pending)
         try:
-            return session._reflow(index, unit, ov, uid, push, adjust, accept_all)
+            return session._reflow(index, unit, ov, uid, push, adjust, accept_all, quick)
         finally:
             if session is not self:
                 session.close()
 
-    def _reflow(self, index, unit, ov, uid, push, adjust, accept_all) -> ReflowResult:
+    def _reflow(self, index, unit, ov, uid, push, adjust, accept_all, quick=False) -> ReflowResult:
         pe = _pe()
         effective = pe._effective(unit, ov)
         zone = self._zone(index, unit, effective, ov)
@@ -839,6 +899,8 @@ class FlowMixin:
             for item in result.pending:
                 item["uid"] = uid
             return result
+        if quick:     # vista previa mientras se arrastra: las opciones se calculan al soltar
+            return ReflowResult("overflow")
         candidates = {}
         newpage = self._flow(index, zone, push, adjust, "newpage")
         result = self._bake(index, newpage, accept_all, font_ok)

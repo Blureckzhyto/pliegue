@@ -65,6 +65,7 @@ Pliegue es gratis y de código abierto (licencia AGPL-3.0). Código fuente: http
 ```
 Novedades en Editar PDF:
 • El texto que no cabe pasa al renglón siguiente y desplaza el contenido de abajo.
+• Puedes ensanchar o angostar el cuadro de texto y el texto se acomoda solo.
 • Si ya no cabe en la página, puedes continuar en una página nueva o reducir un poco la letra o el interlineado, con vista previa.
 • Puedes deshacer todo el cambio de un solo paso.
 ```

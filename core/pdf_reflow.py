@@ -36,6 +36,7 @@ PAINT = {"S", "s", "f", "F", "f*", "B", "B*", "b", "b*"}
 CONSTRUCT = {"m", "l", "c", "v", "y", "re", "h"}
 STROKING = {"S", "s", "B", "B*", "b", "b*"}
 WIDTH_TOL = 1.01          # holgura al medir (los anchos reales rara vez coinciden al milímetro)
+EXACT_TOL = 1.003         # con un ancho elegido por el usuario: casi nada (solo el redondeo)
 SPLIT_TOL = 2.0           # pt: lo que empieza más arriba que esto cruza la línea de corte
 GUTTER_MIN = 10.0         # pt: separación mínima entre columnas
 HYPHENS = "-‐"
@@ -52,7 +53,8 @@ class Row:
 
 
 def wrap_rows(text: str, measure, first_width: float, rest_width: float, start: int = 0,
-              hyphen_width: float = 0.0, converge=None) -> tuple[list[Row], int | None]:
+              hyphen_width: float = 0.0, converge=None,
+              tolerance: float = WIDTH_TOL) -> tuple[list[Row], int | None]:
     """Reparte `text[start:]` en renglones. `measure(a, b)` da el ancho de `text[a:b]`.
 
     `converge(pos)` se consulta al empezar cada renglón: si devuelve un número, el resto del
@@ -78,7 +80,7 @@ def wrap_rows(text: str, measure, first_width: float, rest_width: float, start: 
             word_end = i
             while word_end < stop and text[word_end] != " ":
                 word_end += 1
-            if measure(row_start, word_end) <= width() * WIDTH_TOL:
+            if measure(row_start, word_end) <= width() * tolerance:
                 fit_end, i = word_end, word_end
                 continue
             if fit_end is not None:      # el renglón termina antes de esta palabra
@@ -90,7 +92,7 @@ def wrap_rows(text: str, measure, first_width: float, rest_width: float, start: 
             # la palabra sola no cabe: se parte con guion donde alcance
             cut = i + 1
             low, high = i + 1, word_end
-            limit = width() * WIDTH_TOL - hyphen_width
+            limit = width() * tolerance - hyphen_width
             while low <= high:
                 middle = (low + high) // 2
                 if measure(row_start, middle) <= limit:

@@ -386,6 +386,68 @@ check("una letra más no parte la línea", not s.needs_reflow(0, target["id"], o
 check("el margen derecho es como el izquierdo", abs(s.columns(0)[0][1] - (595 - 72)) < 1, str(s.columns(0)))
 s.close()
 
+print("== ancho del cuadro")
+pdf = fixtures.reflow_page(TMP / "ancho.pdf")
+s = pdf_editor.EditorSession(pdf)
+original = s.data
+block = next(b for b in s.analyze(0)["blocks"] if "Este informe" in b["text"])
+flowed = s.flow_text(0, block["id"])
+left, right = block["bbox"][0], block["bbox"][2]
+final = line_with(s, "Texto final")["bbox"][1]
+words_before = Counter(w[4] for w in s.doc[0].get_text("words"))
+narrow = {"text": flowed, "box": [left, right - 150]}
+check("angostar necesita desplazar", s.needs_reflow(0, block["id"], narrow, True, False))
+state = {"overrides": {block["id"]: narrow}, "added": [], "z": None}
+result = s.reflow(0, state, block["id"])
+check("angostar: aplica", result.status == "done", result.status)
+s.adopt(result.data)
+rows = [l for l in s.analyze(0)["lines"] if l["bbox"][1] < line_with(s, "Primer parrafo")["bbox"][1]
+        and l["bbox"][1] > 100]
+check("angostar: renglones dentro del ancho nuevo", max(l["bbox"][2] for l in rows) <= right - 150 + 1,
+      f"{max(l['bbox'][2] for l in rows):.1f}")
+check("angostar: más renglones", len(rows) > len(block["line_ids"]), f"{len(block['line_ids'])} → {len(rows)}")
+check("angostar: lo de abajo bajó exacto", abs(line_with(s, "Texto final")["bbox"][1] - final - result.shift) <= 0.5)
+words_after = Counter(w[4] for w in s.doc[0].get_text("words"))
+check("angostar: no se pierde ninguna palabra", all(words_after[w] >= n for w, n in words_before.items()))
+check("angostar: misma fuente, tamaño y color", all(
+    l["style"]["font"] == "Helvetica" and abs(l["style"]["size"] - 11) < 0.01 for l in rows))
+s.adopt(original)
+
+moved = {"text": flowed, "box": [left + 60, right]}
+result = s.reflow(0, {"overrides": {block["id"]: moved}, "added": [], "z": None}, block["id"])
+s.adopt(result.data)
+rows = [l for l in s.analyze(0)["lines"] if "informe" in l["text"] and l["bbox"][1] < 200]
+check("tirador izquierdo: el texto empieza en el borde nuevo", abs(min(l["bbox"][0] for l in rows) - (left + 60)) < 1,
+      f"{min(l['bbox'][0] for l in rows):.1f}")
+s.adopt(original)
+
+line = line_with(s, "Primer parrafo")
+ov = {"text": line["text"], "box": [line["bbox"][0], line["bbox"][0] + 200]}
+result = s.reflow(0, {"overrides": {line["id"]: ov}, "added": [], "z": None}, line["id"])
+check("modo Línea: la línea pasa a ser párrafo", result.status == "done" and result.extra_lines >= 1, result.message)
+s.adopt(original)
+
+limits = s.width_limits(0, block["id"])
+longest = max(flowed.split(), key=len)
+check("el mínimo es la palabra más larga", limits["min_width"] >= len(longest) * 3 and limits["min_width"] < 90,
+      f"{limits['min_width']:.1f} ({longest})")
+check("el máximo es el margen", abs(limits["right"] - (595.28 - 72)) < 8, f"{limits['right']:.1f}")
+same = {"text": flowed, "box": [left, right]}
+check("con el mismo ancho no se mueve nada", not s.needs_reflow(0, block["id"], same, True, True))
+s.close()
+pdf = fixtures.reflow_columns(TMP / "ancho2.pdf")
+s = pdf_editor.EditorSession(pdf)
+line = line_with(s, "Columna izquierda 1")
+limits = s.width_limits(0, line["id"])
+check("dos columnas: el máximo es el borde de la columna", limits["right"] <= s.columns(0)[0][1] + 0.5, f"{limits['right']:.1f}")
+s.close()
+pdf = fixtures.reflow_beside(TMP / "ancho3.pdf")
+s = pdf_editor.EditorSession(pdf)
+line = line_with(s, "Linea 3")
+limits = s.width_limits(0, line["id"])
+check("no puede meterse en la imagen de al lado", limits["right"] < s.analyze(0)["images"][0]["bbox"][0], f"{limits['right']:.1f}")
+s.close()
+
 print("== nada se cancela en silencio")
 pdf = fixtures.reflow_page(TMP / "seguro.pdf")
 s = pdf_editor.EditorSession(pdf)

@@ -30,7 +30,8 @@ TOOLS = [("select", "Seleccionar y editar", "select"), ("text", "Añadir texto",
          ("highlight", "Resaltar", "highlight"), ("draw", "Dibujar", "draw"),
          ("image", "Insertar imagen", "image"), ("redact", "Redactar (borra el contenido)", "redact-tool")]
 TOOL_HINTS = {
-    "select": "Doble clic en un texto para editarlo · arrastra para mover · Supr borra · flechas mueven 1 pt (Mayús: 10 pt).",
+    "select": "Doble clic en un texto para editarlo · arrastra para mover · tiradores: ancho del cuadro · "
+              "Supr borra · flechas mueven 1 pt (Mayús: 10 pt).",
     "text": "Clic donde quieras escribir: toma el estilo del texto más cercano.",
     "highlight": "Arrastra sobre el texto para resaltarlo.",
     "draw": "Dibuja a mano alzada.",
@@ -41,6 +42,8 @@ ZOOMS = ["Ajustar ancho", "50 %", "75 %", "100 %", "125 %", "150 %", "200 %", "3
 PX_PER_PT = 96 / 72
 MARGIN = 24
 HANDLE = 5
+WIDTH_HANDLE = 4          # tiradores de ancho de un cuadro de texto
+WIDTH_PREVIEW_MS = 50     # pausa entre vistas previas al arrastrar uno
 THUMB_ZOOM = 0.18
 THUMB_W = 116
 DRAG_PX = 4               # menos movimiento que esto con el botón presionado es un clic
@@ -100,6 +103,9 @@ class PdfEditorView(ToolView):
         self.ed_push = True          # el texto que crece desplaza el contenido de abajo
         self.ed_adjust = False       # el texto que se acorta sube el contenido de abajo
         self.ed_reflowing = False    # hay una edición integrándose al documento (en segundo plano)
+        self.ed_width_job = None     # vista previa pendiente al arrastrar un tirador de ancho
+        self.ed_width_busy = False
+        self.ed_width_again = False
         self.ed_pending_double = None  # doble clic llegado antes de que la página esté lista
         self.ed_thumbs: dict[int, ImageTk.PhotoImage] = {}
         self.ed_thumbs_loading: set[int] = set()
@@ -203,6 +209,9 @@ class PdfEditorView(ToolView):
         for key, (dx, dy) in {"Left": (-1, 0), "Right": (1, 0), "Up": (0, -1), "Down": (0, 1)}.items():
             c.bind(f"<{key}>", lambda _e, d=(dx, dy): self._nudge(*d, 1))
             c.bind(f"<Shift-{key}>", lambda _e, d=(dx, dy): self._nudge(*d, 10))
+            if key in ("Left", "Right"):       # Alt + flechas: el ancho del cuadro de texto
+                c.bind(f"<Alt-{key}>", lambda _e, s=dx: self._nudge_width(s, 1))
+                c.bind(f"<Alt-Shift-{key}>", lambda _e, s=dx: self._nudge_width(s, 10))
         for seq in ("<Control-z>", "<Control-Z>"):
             c.bind(seq, lambda _e: self._undo())
         for seq in ("<Control-y>", "<Control-Y>", "<Control-Shift-Z>"):
@@ -538,10 +547,15 @@ class PdfEditorView(ToolView):
         c = self.ed_canvas
         c.delete("overlay")
         geom = getattr(self, "ed_editor_geom", None)
+        drag = self.ed_drag
+        if drag and drag.get("mode") == "width":
+            self._draw_width_drag(drag)
+            return
         if self.ed_editor and geom:
             x0, y0, x1, y1 = geom
             c.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline=theme.resolve(theme.ACCENT),
                                width=2, tags="overlay")
+            self._draw_width_handles(x0, y0, x1, y1)
             return
         if self.ed_hover and self.ed_hover != self.ed_selected:
             box = self._box(self.ed_hover)
@@ -550,7 +564,7 @@ class PdfEditorView(ToolView):
                 c.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3,
                                    outline=theme.resolve(theme.FOCUS_RING), width=2, tags="overlay")
         if self.ed_selected:
-            box = self._box(self.ed_selected)
+            box = self._text_frame(self.ed_selected) or self._box(self.ed_selected)
             if box:
                 x0, y0, x1, y1 = self._to_screen(box)
                 accent = theme.resolve(theme.ACCENT)
@@ -560,6 +574,202 @@ class PdfEditorView(ToolView):
                     for hx, hy in ((x0, y0), (x1, y0), (x0, y1), (x1, y1)):
                         c.create_rectangle(hx - HANDLE, hy - HANDLE, hx + HANDLE, hy + HANDLE,
                                            fill="#FFFFFF", outline=accent, width=2, tags="overlay")
+                if self._text_frame(self.ed_selected) and self.ed_tool == "select":
+                    self._draw_width_handles(x0, y0, x1, y1)
+
+    # ------------------------------------------------------------------ ancho del cuadro de texto
+
+    def _text_frame(self, uid):
+        """Cuadro de un texto en puntos: su ancho elegido o, si no, lo que ocupa."""
+        element = self._element(uid)
+        if not element or element["kind"] != "text":
+            return None
+        box = self._box(uid)
+        if not box:
+            return None
+        fixed = element.get("box")
+        return [fixed[0], box[1], fixed[1], box[3]] if fixed else list(box)
+
+    @staticmethod
+    def _handle_points(x0, y0, x1, y1):
+        """Tiradores en pantalla: los lados y las esquinas (todos cambian solo el ancho)."""
+        middle = (y0 + y1) / 2
+        return [("w", x0 - 3, middle), ("e", x1 + 3, middle), ("w", x0 - 3, y0 - 3), ("e", x1 + 3, y0 - 3),
+                ("w", x0 - 3, y1 + 3), ("e", x1 + 3, y1 + 3)]
+
+    def _draw_width_handles(self, x0, y0, x1, y1):
+        accent = theme.resolve(theme.ACCENT)
+        for _side, hx, hy in self._handle_points(x0, y0, x1, y1):
+            self.ed_canvas.create_rectangle(hx - WIDTH_HANDLE, hy - WIDTH_HANDLE, hx + WIDTH_HANDLE,
+                                            hy + WIDTH_HANDLE, fill="#FFFFFF", outline=accent, width=2,
+                                            tags="overlay")
+
+    def _handle_frame(self):
+        """(id, cuadro en pantalla) del texto con tiradores visibles."""
+        if self.ed_tool != "select":
+            return None, None
+        if self.ed_editor:
+            return self.ed_editor[1], getattr(self, "ed_editor_geom", None)
+        uid = self.ed_selected
+        frame = self._text_frame(uid) if uid else None
+        return uid, self._to_screen(frame) if frame else None
+
+    def _handle_at(self, event):
+        """"w", "e" o None según el tirador que esté bajo el mouse."""
+        _uid, frame = self._handle_frame()
+        if not frame or not self._editable_quiet():
+            return None
+        cx, cy = self.ed_canvas.canvasx(event.x), self.ed_canvas.canvasy(event.y)
+        for side, hx, hy in self._handle_points(*frame):
+            if abs(cx - hx) <= WIDTH_HANDLE + 3 and abs(cy - hy) <= WIDTH_HANDLE + 3:
+                return side
+        return None
+
+    def _width_limits(self, uid):
+        element = self._element(uid)
+        ov = self._st()["overrides"].get(uid, {})
+        limits = self.ed_session.width_limits(self.ed_current, uid, ov, element)
+        dx = ov.get("dx", 0)
+        return {**limits, "left": limits["left"] + dx, "right": limits["right"] + dx}
+
+    @staticmethod
+    def _width_bounds(frame, side, x, symmetric, limits):
+        """Bordes nuevos del cuadro con el tirador en `x`: nunca menos que la palabra más larga
+        ni más allá de la columna. Con Mayús, simétrico desde el centro."""
+        x0, x1, least = frame[0], frame[2], limits["min_width"]
+        if symmetric:
+            center = (x0 + x1) / 2
+            half = max(least / 2, abs(x - center))
+            half = min(half, center - limits["left"], limits["right"] - center)
+            return center - half, center + half
+        if side == "e":
+            return x0, max(x0 + least, min(x, limits["right"]))
+        return min(x1 - least, max(x, limits["left"])), x1
+
+    def _start_width_drag(self, uid, side, event):
+        snapshot = self._snapshot()      # un solo paso de deshacer, también si entra a modo párrafo
+        self._prepare(uid, push=False)
+        frame = self._text_frame(uid)
+        if frame is None:
+            return
+        self._select(uid)
+        self.ed_drag = {"mode": "width", "uid": uid, "side": side, "frame": frame, "x0": frame[0],
+                        "x1": frame[2], "moved": False, "limits": self._width_limits(uid),
+                        "snapshot": snapshot, "start": self._to_pt(event.x, event.y)[0],
+                        "origin_x": frame[2] if side == "e" else frame[0]}
+        self.show_info("Arrastra para cambiar el ancho · Mayús: desde el centro.")
+
+    def _width_moved(self, drag, x, symmetric):
+        target = drag["origin_x"] + x - drag["start"]
+        x0, x1 = self._width_bounds(drag["frame"], drag["side"], target, symmetric, drag["limits"])
+        if abs(x0 - drag["x0"]) < 0.01 and abs(x1 - drag["x1"]) < 0.01:
+            return
+        drag.update(x0=x0, x1=x1)
+        drag["moved"] = abs(x0 - drag["frame"][0]) > 0.25 or abs(x1 - drag["frame"][2]) > 0.25
+        self._draw_overlay()
+        if self.ed_width_job is None:
+            self.ed_width_job = self.after(WIDTH_PREVIEW_MS, self._width_preview)
+
+    def _draw_width_drag(self, drag):
+        c = self.ed_canvas
+        accent = theme.resolve(theme.ACCENT)
+        frame = drag["frame"]
+        x0, y0, x1, y1 = self._to_screen([drag["x0"], frame[1], drag["x1"], frame[3]])
+        c.create_rectangle(x0 - 3, y0 - 3, x1 + 3, y1 + 3, outline=accent, dash=(5, 3), width=2, tags="overlay")
+        self._draw_width_handles(x0, y0, x1, y1)
+        limits = drag["limits"]
+        height = self.ed_image.height + MARGIN if self.ed_image is not None else y1
+        touching = []
+        if drag["x1"] >= limits["right"] - 0.05:
+            touching.append(x1)
+        if drag["x0"] <= limits["left"] + 0.05:
+            touching.append(x0)
+        for x in touching:      # guía: llegó al margen o al borde de la columna
+            c.create_line(x, MARGIN, x, height, fill=accent, dash=(2, 4), width=1, tags="overlay")
+        drag["guide"] = bool(touching)
+
+    def _width_override(self, uid, x0, x1, state):
+        """Pone el ancho en `state` (el estado de la página o una copia para la vista previa)."""
+        if uid.startswith("N"):
+            element = next(a for a in state["added"] if a["id"] == uid)
+            element["box"] = [x0, x1]
+            element["origin"] = [x0, element["origin"][1]]
+            element["bbox"] = [x0, element["bbox"][1], x1, element["bbox"][3]]
+            return None
+        ov = state["overrides"].setdefault(uid, {})
+        dx = ov.get("dx", 0)
+        ov["box"] = [x0 - dx, x1 - dx]
+        if "text" not in ov:     # un párrafo se reacomoda corrido, sin los saltos de renglón del PDF
+            element = self._element(uid)
+            flowed = self.ed_session.flow_text(self.ed_current, uid) if uid.startswith("B") else None
+            ov["text"] = flowed or element["text"]
+        return ov
+
+    def _width_preview(self):
+        """El texto se reacomoda mientras se arrastra (con la misma lógica que al soltar)."""
+        self.ed_width_job = None
+        drag = self.ed_drag
+        if not drag or drag.get("mode") != "width" or self.ed_session is None:
+            return
+        if self.ed_width_busy:
+            self.ed_width_again = True
+            return
+        state = copy.deepcopy(self._st())
+        self._width_override(drag["uid"], drag["x0"], drag["x1"], state)
+        index, scale, session, uid = self.ed_current, self.ed_scale, self.ed_session, drag["uid"]
+        push, adjust = self.ed_push, self.ed_adjust
+        self.ed_width_busy = True
+
+        def finished():
+            self.ed_width_busy = False
+            if self.ed_width_again and self.ed_drag is drag:
+                self.ed_width_again = False
+                self.ed_width_job = self.after(WIDTH_PREVIEW_MS, self._width_preview)
+
+        def done(image):
+            if self.ed_drag is drag:
+                self.ed_image = image
+                self._draw_page()
+            finished()
+
+        run_task(self, lambda _p: session.preview_width(index, state, uid, scale, push, adjust), done,
+                 lambda _exc: finished())
+
+    def _apply_width(self, uid, x0, x1, snapshot=None):
+        """Aplica el ancho: las mismas reglas que al escribir (desplazar, diálogo, deshacer)."""
+        if snapshot is None:
+            self._push_undo()
+        else:
+            self.ed_undo.append(snapshot)
+            del self.ed_undo[:-UNDO_LIMIT]
+            self.ed_redo.clear()
+        state = self._st()
+        previous = copy.deepcopy(state["overrides"].get(uid))
+        override = self._width_override(uid, x0, x1, state)
+        self.ed_layout.pop(uid, None)
+        if override is not None:
+            self.ed_verify.setdefault((self.ed_current, uid), previous)
+            if self._needs_reflow(uid, override):
+                self.ed_verify.pop((self.ed_current, uid), None)
+                self._start_reflow(uid)
+                return
+        self._after_change()
+        self.show_info("Ancho del cuadro actualizado (Ctrl+Z para deshacer).")
+
+    def _nudge_width(self, sign, step):
+        """Alt + flechas: el borde derecho, de a 1 pt (con Mayús, 10 pt)."""
+        uid = self.ed_selected
+        if not uid or self._kind(uid) != "text" or not self._editable() or self.ed_reflowing:
+            return "break"
+        snapshot = self._snapshot()
+        self._prepare(uid, push=False)
+        frame = self._text_frame(uid)
+        if frame is None:
+            return "break"
+        x0, x1 = self._width_bounds(frame, "e", frame[2] + sign * step, False, self._width_limits(uid))
+        if abs(x1 - frame[2]) > 0.01:
+            self._apply_width(uid, x0, x1, snapshot)
+        return "break"
 
     def _select(self, uid, render=True):
         # volver a elegir lo mismo no reconstruye la barra (sin parpadeos ni saltos)
@@ -593,6 +803,9 @@ class PdfEditorView(ToolView):
 
     def _on_motion(self, event):
         if self.ed_drag or not self._editable_quiet():
+            return
+        if self._handle_at(event):
+            self.ed_canvas.configure(cursor="sb_h_double_arrow")
             return
         x, y = self._to_pt(event.x, event.y)
         hover = self._hit(x, y) if self.ed_tool == "select" else None
@@ -630,8 +843,12 @@ class PdfEditorView(ToolView):
     def _on_press(self, event):
         if self.focus_get() is not self.ed_canvas:
             self.ed_canvas.focus_force()   # también activa la ventana: el clic sigue procesándose
+        handle = self._handle_at(event)
         if self.ed_editor:
+            uid = self.ed_editor[1]
             self._commit_edit()
+            if handle and not self.ed_reflowing and self.ed_overflow_dialog is None:
+                self._start_width_drag(uid, handle, event)
             return
         if self.ed_reflowing:
             return
@@ -644,6 +861,9 @@ class PdfEditorView(ToolView):
         x, y = self._to_pt(event.x, event.y)
         tool = self.ed_tool
         if tool == "select":
+            if handle:
+                self._start_width_drag(self.ed_selected, handle, event)
+                return
             corner = self._corner_at(event) if self.ed_selected and self._resizable(self.ed_selected) else None
             if corner:
                 self.ed_drag = {"mode": "resize", "corner": corner, "uid": self.ed_selected,
@@ -681,7 +901,9 @@ class PdfEditorView(ToolView):
             return
         x, y = self._to_pt(event.x, event.y)
         c = self.ed_canvas
-        if drag["mode"] == "move":
+        if drag["mode"] == "width":
+            self._width_moved(drag, x, bool(event.state & 0x1))
+        elif drag["mode"] == "move":
             dx, dy = x - drag["start"][0], y - drag["start"][1]
             # hasta 4 px de temblor sigue siendo un clic (no mueve nada)
             if not drag["moved"] and math.hypot(event.x - drag["screen"][0],
@@ -756,7 +978,15 @@ class PdfEditorView(ToolView):
         c.delete("ghost_cover")
         if not drag or drag["mode"] == "pan":
             return
-        if drag["mode"] == "move" and drag.get("moved"):
+        if drag["mode"] == "width":
+            if self.ed_width_job is not None:
+                self.after_cancel(self.ed_width_job)
+                self.ed_width_job = None
+            if drag["moved"]:
+                self._apply_width(drag["uid"], drag["x0"], drag["x1"], drag["snapshot"])
+            else:
+                self._draw_overlay()
+        elif drag["mode"] == "move" and drag.get("moved"):
             self._move(drag["uid"], *drag["delta"])
         elif drag["mode"] in ("move", "click") and drag.get("reselect") \
                 and self._kind(drag["uid"]) == "text":
@@ -871,11 +1101,11 @@ class PdfEditorView(ToolView):
         self._build_props()
         self._schedule_render(0)
 
-    def _prepare(self, uid):
+    def _prepare(self, uid, push=True):
         """Un bloque se edita como párrafo: antes del primer cambio se activa ese modo
         (combinando lo que ya se haya editado en sus líneas)."""
         if uid and uid.startswith("B") and uid not in self._st()["overrides"]:
-            self._enter_block_mode(uid)
+            self._enter_block_mode(uid, push)
 
     def _move(self, uid, dx, dy):
         self._prepare(uid)
@@ -902,6 +1132,8 @@ class PdfEditorView(ToolView):
         element["bbox"] = [b[0] + dx, b[1] + dy, b[2] + dx, b[3] + dy]
         if "origin" in element:
             element["origin"] = [element["origin"][0] + dx, element["origin"][1] + dy]
+        if "box" in element:
+            element["box"] = [element["box"][0] + dx, element["box"][1] + dx]
         if "points" in element:
             element["points"] = [[p[0] + dx, p[1] + dy] for p in element["points"]]
 
@@ -1078,13 +1310,18 @@ class PdfEditorView(ToolView):
         """Hasta dónde puede crecer el texto: {right, rest_x, align} en puntos."""
         room = None
         if not uid.startswith("N"):
+            ov = self._st()["overrides"].get(uid, {})
             try:
-                room = self.ed_session.edit_geometry(self.ed_current, uid)
+                room = self.ed_session.edit_geometry(self.ed_current, uid, ov)
             except Exception:
                 errors.record("No se pudo calcular el ancho del párrafo")
+            if room is not None:
+                room["right"] += ov.get("dx", 0)
+                room["rest_x"] += ov.get("dx", 0)
         if room is None:
             width = self._model()["width"]
-            room = {"right": width - max(36.0, min(72.0, origin[0])), "rest_x": origin[0],
+            box = element.get("box")
+            room = {"right": box[1] if box else width - max(36.0, min(72.0, origin[0])), "rest_x": origin[0],
                     "align": element["style"].get("align", "left")}
         return room
 
@@ -1173,6 +1410,9 @@ class PdfEditorView(ToolView):
         if not is_block:
             widget.bind("<Return>", lambda _e: (self._commit_edit(), "break")[1])
         widget.bind("<Control-Return>", lambda _e: (self._commit_edit(), "break")[1])
+        for sequence, sign, step in (("<Alt-Left>", -1, 1), ("<Alt-Right>", 1, 1),
+                                     ("<Alt-Shift-Left>", -1, 10), ("<Alt-Shift-Right>", 1, 10)):
+            widget.bind(sequence, lambda _e, a=sign, b=step: (self._commit_edit(), self._nudge_width(a, b))[1])
         widget.bind("<Escape>", lambda _e: (self._commit_edit(cancel=True), "break")[1])
         self.show_info("Escribe el texto nuevo · Enter (o Ctrl+Enter en párrafos) confirma · Esc cancela.")
 
@@ -1470,7 +1710,7 @@ class PdfEditorView(ToolView):
         self.show_info("Editando párrafos completos: el texto se acomoda al ancho original."
                        if level == "block" else "Editando línea por línea.")
 
-    def _enter_block_mode(self, block_id):
+    def _enter_block_mode(self, block_id, push=True):
         """Pasa un bloque a edición por párrafo, conservando lo ya editado en sus líneas."""
         state = self._st()
         if block_id in state["overrides"]:
@@ -1485,7 +1725,8 @@ class PdfEditorView(ToolView):
             if not ov.get("deleted"):
                 line = next(l for l in model["lines"] if l["id"] == line_id)
                 texts.append(ov.get("text", line["text"]))
-        self._push_undo()
+        if push:
+            self._push_undo()
         for line_id in block["line_ids"]:
             state["overrides"].pop(line_id, None)
         state["overrides"][block_id] = {"text": "\n".join(texts)} if changed else {}

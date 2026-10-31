@@ -353,6 +353,39 @@ def _mouse(x, y, clicks=1):
         user32.mouse_event(0x0004, 0, 0, 0, 0)
 
 
+def _drag(start, end, settle, steps=10, before_release=None):
+    """Arrastre real del mouse. `before_release` corre con el botón todavía presionado."""
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.argtypes = [wintypes.POINT]
+    user32.WindowFromPoint.restype = wintypes.HWND
+    point = wintypes.POINT(int(start[0]), int(start[1]))
+    _wait_clear(lambda: _owned_by_us(user32.WindowFromPoint(point)),
+                f"otra ventana tapa el punto ({point.x}, {point.y}): no se arrastró")
+    user32.SetCursorPos(point.x, point.y)
+    settle(60)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    settle(60)
+    for n in range(1, steps + 1):
+        user32.SetCursorPos(int(start[0] + (end[0] - start[0]) * n / steps),
+                            int(start[1] + (end[1] - start[1]) * n / steps))
+        settle(40)
+    if before_release is not None:
+        before_release()
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    settle(60)
+
+
+def _handle_point(v, side):
+    """Tirador de ancho (lado izquierdo o derecho, a media altura) en coordenadas de pantalla."""
+    _uid, frame = v._handle_frame()
+    _name, x, y = next(p for p in v._handle_points(*frame) if p[0] == side)
+    c = v.ed_canvas
+    return c.winfo_rootx() + x - c.canvasx(0), c.winfo_rooty() + y - c.canvasy(0)
+
+
 def _key(name):
     import ctypes
 
@@ -544,6 +577,30 @@ def _input_cases(app, pdf: Path, out_dir: Path, needle: str, results: list[dict]
     back_text = " ".join(v.ed_session.doc[v.ed_current].get_text().split())
     result["deshecho"] = "palabra" not in back_text and " ".join(original.split()) in back_text
     result["ok"] = result["crecio"] and result["completo"] and result["deshecho"]
+
+    # 7) angostar el cuadro con el tirador: el texto se reacomoda, Deshacer vuelve exacto
+    result = new_result("cambiar el ancho del cuadro con el mouse")
+    line = _pick_line(v._model(), needle)
+    data = v.ed_session.data
+    select(line)
+    d.settle(200)
+    frame = v._text_frame(line["id"])
+    start = _handle_point(v, "e")
+    width = frame[2] - frame[0]
+    _drag(start, (start[0] - width * 0.55 * v.ed_scale, start[1]), d.settle)
+    d.wait(lambda: not v.ed_reflowing, 20)
+    d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
+    d.rendered()
+    rows = [l for l in v._model()["lines"] if l["bbox"][0] < frame[2] and l["bbox"][1] >= frame[1] - 2]
+    words = " ".join(v.ed_session.doc[v.ed_current].get_text().split())
+    result.update(estado=v.status.cget("text"), renglones=len(rows),
+                  completo=all(w in words for w in original.split()))
+    v._undo()
+    d.wait(lambda: v._model() is not None and v.ed_image is not None, 10)
+    d.rendered()
+    result["deshecho"] = v.ed_session.data is data
+    result["ok"] = len(rows) >= 2 and result["completo"] and result["deshecho"] \
+        and "No se pudo" not in result["estado"]
     return results
 
 

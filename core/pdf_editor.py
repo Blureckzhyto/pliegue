@@ -1051,13 +1051,13 @@ class EditorSession(FlowMixin):
         zone = self._zone(index, unit, effective, ov)
         if zone is None:
             return [self._plan_line(page_text, line, line["text"], dx, dy, placement) for line in lines]
-        if len(zone.rows) == zone.old_count == 1 and unit.get("level") != "block":
+        if len(zone.rows) == zone.old_count == 1 and unit.get("level") != "block" and not zone.box:
             return [self._plan_line(page_text, unit, effective["text"], dx, dy, placement)]
         outside = [line for n, line in enumerate(lines) if not zone.first <= n < zone.stop]
         plans = []
         if abs(dx) > LIFT_EPS or abs(dy) > LIFT_EPS or placement != "inplace":
             plans += [self._plan_line(page_text, line, line["text"], dx, dy, placement) for line in outside]
-        if len(zone.rows) == zone.old_count and zone.align == "left" \
+        if len(zone.rows) == zone.old_count and zone.align == "left" and not zone.box \
                 and not any(row.hyphen for row in zone.rows):
             for line, row in zip(lines[zone.first:zone.stop], zone.rows):
                 plans.append(self._plan_line(page_text, line, zone.row_text(row), dx, dy, placement))
@@ -1220,12 +1220,19 @@ class EditorSession(FlowMixin):
                                 style.get("align", "left"), is_last)
         else:
             origin = unit["lines"][0]["origin"] if unit.get("lines") else unit["origin"]
-            # un texto que llegaría hasta el borde de la página sigue en el renglón siguiente
-            room = page.rect.x1 - max(36.0, min(72.0, origin[0])) - origin[0]
+            # un texto que llegaría hasta el borde de la página sigue en el renglón siguiente; con
+            # un ancho elegido por el usuario, ese es su límite
+            box = unit.get("box")
+            room = box[1] - origin[0] if box else page.rect.x1 - max(36.0, min(72.0, origin[0])) - origin[0]
             line_height = float(style.get("line_height") or size * 1.2)
-            rows = _wrap(text, font, size, room) if room > size * 4 else [(t, True) for t in text.split("\n")]
-            for n, (line, _is_last) in enumerate(rows):
-                _append_words(writer, origin[0], origin[1] + n * line_height, line, font, size)
+            rows = (_wrap(text, font, size, room) if box or room > size * 4
+                    else [(t, True) for t in text.split("\n")])
+            for n, (line, is_last) in enumerate(rows):
+                if box:
+                    _append_aligned(writer, line, font, size, origin[0], origin[1] + n * line_height, room,
+                                    style.get("align", "left"), is_last)
+                else:
+                    _append_words(writer, origin[0], origin[1] + n * line_height, line, font, size)
         direction = style.get("dir") or [1, 0]
         morph = None
         if abs(direction[1]) > 1e-3:
@@ -1421,7 +1428,7 @@ def _justify(items, text, extra):
 
 
 def _is_change(ov: dict) -> bool:
-    return bool(ov.get("deleted") or "text" in ov or "style" in ov
+    return bool(ov.get("deleted") or "text" in ov or "style" in ov or "box" in ov
                 or abs(ov.get("dx", 0)) > LIFT_EPS or abs(ov.get("dy", 0)) > LIFT_EPS
                 or "bbox" in ov)
 
@@ -1475,6 +1482,13 @@ def _effective(unit: dict, ov: dict) -> dict:
         el["bbox"] = [el["bbox"][0] + dx, el["bbox"][1] + dy, el["bbox"][2] + dx, el["bbox"][3] + dy]
         for line in el["lines"]:
             line["origin"] = [line["origin"][0] + dx, line["origin"][1] + dy]
+    if ov.get("box"):       # ancho elegido por el usuario (sin contar lo que se haya movido)
+        left, right = ov["box"][0] + dx, ov["box"][1] + dx
+        shift = left - el["bbox"][0]
+        el["box"] = [left, right]
+        el["bbox"] = [left, el["bbox"][1], right, el["bbox"][3]]
+        for line in el["lines"]:
+            line["origin"] = [line["origin"][0] + shift, line["origin"][1]]
     return el
 
 
